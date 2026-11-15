@@ -1,0 +1,169 @@
+:root {
+  color-scheme: light dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  color: #24212c;
+  background: #f4eef2;
+  --surface: #ffffffd9;
+  --stroke: #46243c24;
+  --muted: #595362;
+  --link: #654178;
+  --notes: #6955720f;
+  --warm: #ffe7ed;
+  --cool: #e5e7fa;
+  --base: #f4eef2;
+  --shadow: #43274423;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  margin: 0;
+  padding: 36px 20px;
+  background:
+    radial-gradient(ellipse at 12% 4%, var(--warm), transparent 55%),
+    radial-gradient(ellipse at 90% 95%, var(--cool), transparent 55%),
+    var(--base);
+}
+
+main {
+  width: min(100%, 850px);
+  padding: clamp(24px, 6vw, 52px);
+  border: 1px solid var(--stroke);
+  border-radius: 28px;
+  background: var(--surface);
+  box-shadow: 0 24px 72px var(--shadow);
+}
+
+header { text-align: center; }
+
+.mark {
+  position: relative;
+  width: 80px;
+  height: 80px;
+  margin: 0 auto;
+  border: 1px solid #c77b9b;
+  border-radius: 23px;
+  background: radial-gradient(circle at 28% 21%, #f9d5e6, transparent 57%), #e8a3c5;
+  box-shadow: 0 12px 26px #8c457d3d;
+}
+
+.mark span {
+  position: absolute;
+  display: block;
+  border: 2px solid #7d436b;
+  border-radius: 50%;
+  background: #faecf3b3;
+}
+
+.mark span:nth-child(1) { width: 29px; height: 32px; top: 13px; left: 13px; transform: rotate(-18deg); }
+.mark span:nth-child(2) { width: 24px; height: 23px; top: 35px; left: 43px; transform: rotate(16deg); }
+.mark span:nth-child(3) { width: 15px; height: 15px; top: 48px; left: 20px; }
+
+h1 {
+  margin: 14px 0 7px;
+  font-size: clamp(2.5rem, 6vw, 3.6rem);
+  line-height: 1.1;
+  letter-spacing: -.055em;
+}
+
+.intro {
+  max-width: 36rem;
+  margin: 0 auto;
+  color: var(--muted);
+  font-size: 1.04rem;
+  line-height: 1.65;
+  text-wrap: pretty;
+}
+
+h2 { margin: 0 0 13px; font-size: 1.04rem; font-weight: 680; }
+
+.downloads { margin-top: 34px; }
+
+.platforms {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.platform {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 17px 16px;
+  border-radius: 15px;
+  color: #fff;
+  text-decoration: none;
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.platform.mac { background: #463252; }
+.platform.windows { background: #285d70; }
+.platform strong { font-size: 1rem; }
+.platform span { color: #ffffffd6; font-size: .83rem; }
+.platform .download-link { margin-top: 10px; color: #fff; font-size: .9rem; font-weight: 650; }
+
+.platform:hover, .platform:focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 20px var(--shadow);
+}
+
+a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.platform:focus-visible { outline-color: var(--link); }
+
+.release-links {
+  margin: 15px 0 0;
+  color: var(--muted);
+  font-size: .86rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.release-links a { color: var(--link); text-underline-offset: 3px; }
+.release-links span { margin: 0 3px; }
+
+.install {
+  margin-top: 28px;
+  padding: 18px 20px;
+  border: 1px solid var(--stroke);
+  border-radius: 15px;
+  background: var(--notes);
+}
+
+.install h2 { margin-bottom: 8px; }
+.install p { margin: 0; color: var(--muted); font-size: .89rem; line-height: 1.65; }
+.install p + p { margin-top: 8px; }
+
+@media (max-width: 640px) {
+  body { padding: 20px 13px; }
+  main { border-radius: 20px; }
+  .platforms { grid-template-columns: 1fr; }
+  .platform { padding: 14px 16px; }
+  .platform .download-link { margin-top: 3px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #f2edf6;
+    background: #1b1720;
+    --surface: #211b28e8;
+    --stroke: #efe0ff26;
+    --muted: #d4c9d9;
+    --link: #efbcef;
+    --notes: #c1a1d71c;
+    --warm: #392534;
+    --cool: #29283e;
+    --base: #1b1720;
+    --shadow: #100a1560;
+  }
+
+  .platform.mac { background: #554062; }
+  .platform.windows { background: #306778; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .platform { transition: none; }
+  .platform:hover, .platform:focus-visible { transform: none; }
+}
