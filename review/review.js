@@ -118,7 +118,7 @@ function saveAnswer(questionIndex) {
 async function readBundle(reviewKey) {
   let bytes;
   try {
-    const response = await fetch('./review-data.bin', {credentials: 'omit', mode: 'same-origin'});
+    const response = await fetch('./review-data.bin?v=300', {credentials: 'omit', mode: 'same-origin', cache: 'no-cache'});
     if (!response.ok) throw new Error();
     bytes = new Uint8Array(await response.arrayBuffer());
   } catch {
@@ -207,7 +207,7 @@ el('unlock-form').addEventListener('submit', async event => {
     storagePrefix = 'ldc-review-v1:' + JSON.stringify([batch.batch_id, reviewerName, keyId]) + ':';
     records = await Promise.all(tiles.map(loadDraft));
     for (const [path, body] of contents) {
-      images.set(path, URL.createObjectURL(new Blob([body], {type: 'image/png'})));
+      images.set(path, body);
     }
     el('access-key').value = '';
     el('reviewer').textContent = reviewerName;
@@ -257,6 +257,14 @@ function renderProgress() {
   }
 }
 
+function imageURL(path) {
+  const entry = images.get(path);
+  if (typeof entry === 'string') return entry;
+  const url = URL.createObjectURL(new Blob([entry], {type: 'image/png'}));
+  images.set(path, url);
+  return url;
+}
+
 function showImage() {
   const tile = tiles[index];
   const request = ++imageRequest;
@@ -279,7 +287,7 @@ function showImage() {
   }
   for (let i = 0; i < 4; i++) target.append(document.createElement('i'));
   const image = document.createElement('img');
-  image.alt = '本題的骨髓 H&E 小圖，藍色短線指向要判斷的位置';
+  image.alt = '本題的骨髓小圖，藍色短線指向要判斷的位置';
   image.width = tile.width;
   image.height = tile.height;
   image.addEventListener('load', () => {
@@ -297,7 +305,7 @@ function showImage() {
   });
   box.append(image, target);
   el('image-slot').replaceChildren();
-  image.src = images.get(tile.raw);
+  image.src = imageURL(tile.raw);
 }
 
 function validLocator(locator) {
@@ -327,7 +335,7 @@ function showLocator() {
   const map = el('locator-map');
   setLocatorFrame(map, locator);
   const previous = map.querySelector('img');
-  const imageUrl = images.get(locator.raw);
+  const imageUrl = imageURL(locator.raw);
   if (previous?.getAttribute('src') === imageUrl && (!previous.complete || previous.naturalWidth)) return;
   const frame = map.querySelector('.locator-frame');
   frame.hidden = true;
