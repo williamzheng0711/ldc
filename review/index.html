@@ -102,6 +102,52 @@
   .target i:nth-child(3), .target i:nth-child(4) { left: 21px; width: 2px; height: 7px; }
   .target i:nth-child(3) { top: 0; }
   .target i:nth-child(4) { bottom: 0; }
+  .outline {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    pointer-events: none;
+  }
+  .outline-shape {
+    fill: none;
+    stroke: #ffdc68;
+    stroke-width: 2;
+    stroke-linejoin: round;
+    filter: drop-shadow(0 0 1px #1a222c);
+  }
+  .outline-edge {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 20;
+    pointer-events: stroke;
+    cursor: crosshair;
+  }
+  .outline-dot {
+    fill: #ffdc68;
+    stroke: #1a222c;
+    stroke-width: 1.4;
+  }
+  .outline-vertex {
+    pointer-events: all;
+    cursor: grab;
+  }
+  .outline-vertex:active { cursor: grabbing; }
+  .outline.adding .outline-vertex { cursor: crosshair; }
+  .outline-vertex:focus-visible { outline: none; }
+  .outline-vertex:focus-visible .outline-dot { fill: #fff; stroke-width: 2.5; }
+  .outline-tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px 10px;
+    color: #d1dde4;
+    font-size: .82rem;
+  }
+  .outline-tools button { min-height: 34px; padding: 5px 9px; }
+  .outline-tools button[aria-pressed="true"] { background: #ffdc68; color: #1a222c; }
   .image-status { color: #dfedf1; font-size: .88rem; text-align: center; padding: 8px 0; }
   .caption { font-size: .82rem; color: #d1dde4; }
   .locator {
@@ -284,6 +330,12 @@
         <p class="image-status" id="image-status" role="status"></p>
         <button id="retry-image" type="button" hidden>重新載入影像</button>
         <p class="caption" id="caption" hidden>藍色短線指向本題要判斷的位置。</p>
+        <div class="outline-tools" id="outline-tools" hidden>
+          <p id="outline-help" role="status"></p>
+          <button id="outline-add" type="button" aria-pressed="false" hidden>新增頂點</button>
+          <button id="outline-reset" type="button" hidden>還原估計輪廓</button>
+          <button id="outline-retry" type="button" hidden>重新載入輪廓</button>
+        </div>
       </section>
       <div class="locator" id="locator" hidden>
         <button type="button" class="locator-open" id="locator-open" aria-label="放大整圖定位" aria-haspopup="dialog" disabled>
@@ -333,6 +385,7 @@
   <div class="locator-map" id="locator-large"><span class="locator-frame" aria-hidden="true" hidden></span></div>
   <p>黃框標出本題小圖的範圍。</p>
 </dialog>
-<script src="./review.js?v=300" defer></script>
+<script src="./outline.js?v=1" defer></script>
+<script src="./review.js?v=301" defer></script>
 </body>
 </html>

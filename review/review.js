@@ -7,11 +7,13 @@ const TARGET = 'target';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', {fatal: true});
 const magic = encoder.encode('LDCREV01');
+const outlineMagic = encoder.encode('LDCOUT01');
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const images = new Map();
 const failedTiles = new Set();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
+let estimates = null, editor = null, loadingEstimates = false;
 let saveQueue = Promise.resolve();
 
 function saveStatus(message, attention = false) {
@@ -28,7 +30,8 @@ function payloadFor() {
     title: batch.title,
     coordinate_system: 'crop_display_top_left_px',
     tiles: tiles.map((tile, i) => {
-      const {decision, note} = records[i];
+      const {decision, note, outline} = records[i];
+      const points = decision === 'correct' ? outline ?? estimates?.[tile.id] : null;
       return {
         tile_id: tile.id,
         source: tile.source,
@@ -38,7 +41,11 @@ function payloadFor() {
         origin_xy_px: tile.origin,
         reviewed: Boolean(decision),
         note,
-        decisions: decision ? [{id: TARGET, decision}] : [],
+        decisions: decision ? [{
+          id: TARGET,
+          decision,
+          ...(points ? {outline_xy_px: points, outline_edited: Boolean(outline)} : {}),
+        }] : [],
         missed: [],
       };
     }),
@@ -84,6 +91,10 @@ async function loadDraft(tile) {
       const record = JSON.parse(decoder.decode(plain));
       if (!record || !(record.decision === '' || validDecisions.has(record.decision)) ||
           typeof record.note !== 'string' || record.note.length > 1500) throw new Error();
+      if (record.outline !== undefined && !validOutline(record.outline, tile)) {
+        delete record.outline;
+        restoreWarning = true;
+      }
       return record;
     }
   } catch {
@@ -144,6 +155,27 @@ async function readBundle(reviewKey) {
   }
 }
 
+async function readEstimates(reviewKey) {
+  const response = await fetch('./review-outlines.bin?v=1', {
+    credentials: 'omit', mode: 'same-origin', cache: 'no-cache',
+  });
+  if (!response.ok) throw new Error();
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const header = bytes.subarray(0, outlineMagic.length);
+  if (bytes.length < 40 || !outlineMagic.every((value, i) => value === header[i])) throw new Error();
+  const plaintext = await crypto.subtle.decrypt({
+    name: 'AES-GCM', iv: bytes.subarray(8, 20), additionalData: header,
+  }, reviewKey, bytes.subarray(20));
+  return JSON.parse(decoder.decode(plaintext));
+}
+
+function checkEstimates(data, manifest) {
+  if (data?.batch_id !== manifest.batch_id || !data.outlines ||
+      !manifest.tiles.every(tile => Object.hasOwn(data.outlines, tile.id) &&
+        validOutline(data.outlines[tile.id], tile))) return null;
+  return data.outlines;
+}
+
 function validTile(tile, contents) {
   if (!tile || typeof tile.id !== 'string' || !tile.id || !Number.isInteger(tile.width) ||
       !Number.isInteger(tile.height) || tile.width < 1 || tile.height < 1 ||
@@ -197,7 +229,10 @@ el('unlock-form').addEventListener('submit', async event => {
   try {
     const raw = decodeBase64(access);
     const reviewKey = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt', 'encrypt']);
-    const {manifest, contents} = await readBundle(reviewKey);
+    const [{manifest, contents}, outlineData] = await Promise.all([
+      readBundle(reviewKey), readEstimates(reviewKey).catch(() => null),
+    ]);
+    estimates = checkEstimates(outlineData, manifest);
     const keyId = encodeBase64(new Uint8Array(await crypto.subtle.digest('SHA-256', raw)).subarray(0, 12));
     raw.fill(0);
     key = reviewKey;
@@ -265,9 +300,37 @@ function imageURL(path) {
   return url;
 }
 
+function setAdding(adding) {
+  editor?.setAdding(adding);
+  el('outline-add').setAttribute('aria-pressed', String(adding));
+  el('outline-help').textContent = adding
+    ? '點一下輪廓邊緣新增頂點。'
+    : '拖曳頂點調整輪廓，或點選輪廓邊緣新增頂點。';
+}
+
+function showOutline() {
+  const visible = editor && records[index].decision === 'correct';
+  el('outline-tools').hidden = !visible;
+  const tile = tiles[index];
+  const estimate = visible ? estimates?.[tile.id] : null;
+  const draft = visible ? records[index].outline : null;
+  const points = draft ?? estimate;
+  setAdding(false);
+  editor?.setPoints(points);
+  el('outline-add').hidden = !points;
+  el('outline-reset').hidden = !draft || !estimate;
+  el('outline-retry').hidden = !visible || Boolean(estimate);
+  el('outline-retry').disabled = loadingEstimates;
+  if (visible && !points) {
+    el('outline-help').textContent = loadingEstimates ? '正在載入輪廓…' : '暫時無法載入估計輪廓。';
+  }
+}
+
 function showImage() {
   const tile = tiles[index];
   const request = ++imageRequest;
+  editor = null;
+  el('outline-tools').hidden = true;
   el('choices').disabled = true;
   el('note').disabled = true;
   el('image-status').textContent = '正在載入影像…';
@@ -297,6 +360,14 @@ function showImage() {
     el('caption').hidden = false;
     el('choices').disabled = false;
     el('note').disabled = false;
+    editor = new OutlineEditor(box, tile, points => {
+      if (request !== imageRequest || records[index].decision !== 'correct') return;
+      records[index].outline = points;
+      el('outline-reset').hidden = !estimates?.[tile.id];
+      setAdding(false);
+      saveAnswer(index);
+    });
+    showOutline();
   });
   image.addEventListener('error', () => {
     if (request !== imageRequest) return;
@@ -401,9 +472,32 @@ el('choices').addEventListener('change', event => {
   const decision = event.target.value;
   if (!validDecisions.has(decision) || decision === records[index].decision) return;
   records[index].decision = decision;
+  showOutline();
+  if (decision === 'correct' && window.matchMedia('(max-width: 710px)').matches) {
+    const target = editor?.svg.hasAttribute('hidden') ? el('outline-tools') : editor?.svg;
+    target?.scrollIntoView({block: 'nearest'});
+  }
   renderProgress();
   saveAnswer(index);
 });
+el('outline-add').onclick = () => setAdding(el('outline-add').getAttribute('aria-pressed') !== 'true');
+el('outline-reset').onclick = () => {
+  delete records[index].outline;
+  showOutline();
+  saveAnswer(index);
+};
+el('outline-retry').onclick = async () => {
+  loadingEstimates = true;
+  showOutline();
+  try {
+    estimates = checkEstimates(await readEstimates(key), batch);
+  } catch {
+    estimates = null;
+  } finally {
+    loadingEstimates = false;
+    showOutline();
+  }
+};
 el('note').oninput = event => {
   records[index].note = event.target.value;
   saveAnswer(index);
