@@ -8,13 +8,19 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', {fatal: true});
 const magic = encoder.encode('LDCREV01');
 const outlineMagic = encoder.encode('LDCOUT01');
+const regionMagic = encoder.encode('LDCCTX01');
+const regionsPerPack = 25;
+const regionPath = /^\/images\/region-SD[0-9]{3}\.webp$/;
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const images = new Map();
+const regions = new Map();
+const regionPackState = new Map();
 const failedTiles = new Set();
 const outlineHistory = new Map();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
 let estimates = null, editor = null, viewport = null, loadingEstimates = false;
+let locatorDialogLevel = 'overview';
 let saveQueue = Promise.resolve();
 
 function saveStatus(message, attention = false) {
@@ -156,17 +162,21 @@ async function readBundle(reviewKey) {
   }
 }
 
-async function readEstimates(reviewKey) {
-  const response = await fetch('./review-outlines.bin?v=2', {
+async function readEncryptedSidecar(path, expectedHeader, reviewKey) {
+  const response = await fetch(path, {
     credentials: 'omit', mode: 'same-origin', cache: 'no-cache',
   });
   if (!response.ok) throw new Error();
   const bytes = new Uint8Array(await response.arrayBuffer());
-  const header = bytes.subarray(0, outlineMagic.length);
-  if (bytes.length < 40 || !outlineMagic.every((value, i) => value === header[i])) throw new Error();
-  const plaintext = await crypto.subtle.decrypt({
+  const header = bytes.subarray(0, expectedHeader.length);
+  if (bytes.length < 40 || !expectedHeader.every((value, i) => value === header[i])) throw new Error();
+  return crypto.subtle.decrypt({
     name: 'AES-GCM', iv: bytes.subarray(8, 20), additionalData: header,
   }, reviewKey, bytes.subarray(20));
+}
+
+async function readEstimates(reviewKey) {
+  const plaintext = await readEncryptedSidecar('./review-outlines.bin?v=2', outlineMagic, reviewKey);
   return JSON.parse(decoder.decode(plaintext));
 }
 
@@ -188,25 +198,61 @@ function validTile(tile, contents) {
       value < (dim === 0 ? tile.width : tile.height));
 }
 
-function parseBundle(plaintext) {
+function parseAssetBundle(plaintext, allowedPath) {
   const manifestLength = new DataView(plaintext).getUint32(0);
   const bytes = new Uint8Array(plaintext);
   let cursor = 4 + manifestLength;
   if (cursor > bytes.length) throw new Error();
-  const {batch: manifest, files} = JSON.parse(decoder.decode(bytes.subarray(4, cursor)));
-  if (!manifest?.batch_id || !Array.isArray(manifest.tiles) || !manifest.tiles.length || !Array.isArray(files)) {
-    throw new Error();
-  }
+  const metadata = JSON.parse(decoder.decode(bytes.subarray(4, cursor)));
+  if (!Array.isArray(metadata?.files)) throw new Error();
   const contents = new Map();
-  for (const {path, length} of files) {
-    if (typeof path !== 'string' || !imagePath.test(path) || contents.has(path) ||
+  for (const {path, length} of metadata.files) {
+    if (typeof path !== 'string' || !allowedPath.test(path) || contents.has(path) ||
         !Number.isSafeInteger(length) || length <= 0 || length > bytes.length - cursor) throw new Error();
     contents.set(path, bytes.subarray(cursor, cursor + length));
     cursor += length;
   }
-  if (cursor !== bytes.length || !manifest.tiles.every(tile => validTile(tile, contents)) ||
+  if (cursor !== bytes.length) throw new Error();
+  return {metadata, contents};
+}
+
+function parseBundle(plaintext) {
+  const {metadata, contents} = parseAssetBundle(plaintext, imagePath);
+  const manifest = metadata.batch;
+  if (!manifest?.batch_id || !Array.isArray(manifest.tiles) || !manifest.tiles.length ||
+      !manifest.tiles.every(tile => validTile(tile, contents)) ||
       new Set(manifest.tiles.map(tile => tile.id)).size !== manifest.tiles.length) throw new Error();
   return {manifest, contents};
+}
+
+function currentRegionPack() {
+  return Math.floor(index / regionsPerPack);
+}
+
+async function loadRegionPack() {
+  const pack = currentRegionPack();
+  if (regionPackState.has(pack)) return;
+  regionPackState.set(pack, 'loading');
+  try {
+    const file = './review-context-' + String(pack + 1).padStart(2, '0') + '.bin?v=1';
+    const plaintext = await readEncryptedSidecar(file, regionMagic, key);
+    const {metadata, contents} = parseAssetBundle(plaintext, regionPath);
+    const expected = tiles.slice(pack * regionsPerPack, (pack + 1) * regionsPerPack);
+    if (metadata.batch_id !== batch.batch_id || !metadata.regions ||
+        Object.keys(metadata.regions).length !== expected.length || contents.size !== expected.length ||
+        !expected.every(tile => {
+          if (!Object.hasOwn(metadata.regions, tile.id)) return false;
+          const entry = metadata.regions[tile.id];
+          return validLocator(entry, regionPath) && validLocatorBox(entry.whole_box) &&
+            entry.raw === '/images/region-' + tile.id + '.webp' && contents.has(entry.raw);
+        })) throw new Error();
+    for (const tile of expected) regions.set(tile.id, metadata.regions[tile.id]);
+    for (const [path, body] of contents) images.set(path, body);
+    regionPackState.set(pack, 'ready');
+  } catch {
+    regionPackState.set(pack, 'failed');
+  }
+  if (pack === currentRegionPack()) showLocator();
 }
 
 el('unlock-form').addEventListener('submit', async event => {
@@ -296,7 +342,8 @@ function renderProgress() {
 function imageURL(path) {
   const entry = images.get(path);
   if (typeof entry === 'string') return entry;
-  const url = URL.createObjectURL(new Blob([entry], {type: 'image/png'}));
+  const type = regionPath.test(path) ? 'image/webp' : 'image/png';
+  const url = URL.createObjectURL(new Blob([entry], {type}));
   images.set(path, url);
   return url;
 }
@@ -407,18 +454,22 @@ function showImage() {
   image.src = imageURL(tile.raw);
 }
 
-function validLocator(locator) {
-  if (!locator || typeof locator.raw !== 'string' || !/^\/images\/[a-z0-9_.-]+\.png$/i.test(locator.raw) ||
-      !Number.isInteger(locator.width) || !Number.isInteger(locator.height) || locator.width < 1 || locator.height < 1 ||
-      !Array.isArray(locator.box) || locator.box.length !== 4 ||
-      !locator.box.every(edge => Number.isFinite(edge) && edge >= 0 && edge <= 1)) return false;
-  const [left, top, right, bottom] = locator.box;
-  return left < right && top < bottom;
+function validLocatorBox(box) {
+  return Array.isArray(box) && box.length === 4 &&
+    box.every(edge => Number.isFinite(edge) && edge >= 0 && edge <= 1) &&
+    box[0] < box[2] && box[1] < box[3];
+}
+
+function validLocator(locator, allowedPath = imagePath) {
+  return locator && typeof locator.raw === 'string' && allowedPath.test(locator.raw) &&
+    Number.isInteger(locator.width) && Number.isInteger(locator.height) &&
+    locator.width > 0 && locator.height > 0 && validLocatorBox(locator.box);
 }
 
 function setLocatorFrame(map, locator) {
   const [left, top, right, bottom] = locator.box;
   map.style.aspectRatio = `${locator.width} / ${locator.height}`;
+  map.style.setProperty('--locator-ratio', locator.width / locator.height);
   map.style.setProperty('--locator-fit', `${(locator.width / locator.height) * 73}svh`);
   map.style.setProperty('--crop-left', `${left * 100}%`);
   map.style.setProperty('--crop-top', `${top * 100}%`);
@@ -426,35 +477,78 @@ function setLocatorFrame(map, locator) {
   map.style.setProperty('--crop-height', `${(bottom - top) * 100}%`);
 }
 
-function showLocator() {
-  const locator = tiles[index].locator;
-  const available = validLocator(locator);
-  el('locator').hidden = !available;
-  if (!available) return;
-  const map = el('locator-map');
-  setLocatorFrame(map, locator);
-  const previous = map.querySelector('img');
-  const imageUrl = imageURL(locator.raw);
-  if (previous?.getAttribute('src') === imageUrl && (!previous.complete || previous.naturalWidth)) return;
+function currentLocators() {
+  const tile = tiles[index];
+  const region = regions.get(tile.id);
+  const overview = region ? {...tile.locator, box: region.whole_box} : tile.locator;
+  return {overview, region};
+}
+
+function showLocatorThumbnail(map, button, locator) {
   const frame = map.querySelector('.locator-frame');
-  frame.hidden = true;
-  el('locator-open').disabled = true;
-  el('locator-copy').textContent = '正在載入整圖…';
+  const previous = map.querySelector('img');
+  if (!locator) {
+    previous?.remove();
+    frame.hidden = true;
+    button.disabled = true;
+    return;
+  }
+  setLocatorFrame(map, locator);
+  const url = imageURL(locator.raw);
+  if (previous?.getAttribute('src') === url && (!previous.complete || previous.naturalWidth)) return;
   previous?.remove();
-  const thumb = new Image(locator.width, locator.height);
-  thumb.alt = '';
-  thumb.addEventListener('load', () => {
-    if (!map.contains(thumb)) return;
+  frame.hidden = true;
+  button.disabled = true;
+  const image = new Image(locator.width, locator.height);
+  image.alt = '';
+  image.addEventListener('load', () => {
+    if (!map.contains(image)) return;
     frame.hidden = false;
-    el('locator-open').disabled = false;
-    el('locator-copy').textContent = '黃框標出本題小圖的位置。點選可放大。';
+    button.disabled = false;
+    el('locator-dialog-region').disabled = el('locator-region-open').disabled;
   });
-  thumb.addEventListener('error', () => {
-    if (!map.contains(thumb)) return;
-    el('locator-copy').textContent = '暫時無法載入整圖。';
+  image.addEventListener('error', () => {
+    if (!map.contains(image)) return;
+    el('locator-copy').textContent = '暫時無法顯示這張定位圖。';
   });
-  map.prepend(thumb);
-  thumb.src = imageUrl;
+  map.prepend(image);
+  image.src = url;
+}
+
+function showLocator() {
+  const {overview, region} = currentLocators();
+  el('locator').hidden = !overview;
+  if (!overview) return;
+  showLocatorThumbnail(el('locator-map'), el('locator-open'), overview);
+  showLocatorThumbnail(el('locator-region-map'), el('locator-region-open'), region);
+  const failed = regionPackState.get(currentRegionPack()) === 'failed';
+  el('locator-region-retry').hidden = !failed;
+  el('locator-copy').textContent = region ? '整圖黃框指向局部，局部黃框指向本題。' :
+    failed ? '局部定位暫時無法載入。整圖黃框仍指向本題。' : '正在載入局部定位…';
+  if (el('locator-dialog').open) showLocatorDialog(locatorDialogLevel);
+}
+
+function showLocatorDialog(level) {
+  const locators = currentLocators();
+  const isRegion = level === 'region';
+  const locator = locators[level];
+  const thumb = el(isRegion ? 'locator-region-map' : 'locator-map').querySelector('img');
+  if (!locator || !thumb?.naturalWidth) return;
+  locatorDialogLevel = level;
+  const map = el('locator-large');
+  const full = thumb.cloneNode();
+  const caption = isRegion || !locators.region ? '黃框標出本題小圖。' : '黃框標出局部定位圖的範圍。';
+  full.alt = (isRegion ? '本題周邊影像。' : '整張切片縮圖。') + caption;
+  map.querySelector('img')?.remove();
+  map.prepend(full);
+  setLocatorFrame(map, locator);
+  map.querySelector('.locator-frame').hidden = false;
+  el('locator-dialog-caption').textContent = caption;
+  el('locator-dialog-overview').setAttribute('aria-pressed', String(!isRegion));
+  el('locator-dialog-region').setAttribute('aria-pressed', String(isRegion));
+  el('locator-dialog-region').disabled = el('locator-region-open').disabled;
+  const dialog = el('locator-dialog');
+  if (!dialog.open) dialog.showModal();
 }
 
 function selectTile(next) {
@@ -465,6 +559,7 @@ function selectTile(next) {
   el('next').disabled = index === tiles.length - 1;
   renderAnswers();
   showImage();
+  void loadRegionPack();
   showLocator();
 }
 
@@ -483,18 +578,15 @@ el('prev').onclick = () => selectTile(index - 1);
 el('next').onclick = () => selectTile(index + 1);
 el('tile-select').onchange = event => selectTile(Number(event.target.value));
 el('retry-image').onclick = showImage;
-el('locator-open').onclick = () => {
-  const locator = tiles[index].locator;
-  const thumb = el('locator-map').querySelector('img');
-  if (!validLocator(locator) || !thumb?.naturalWidth) return;
-  const map = el('locator-large');
-  const full = thumb.cloneNode();
-  full.alt = '原圖縮圖，黃框標出本題小圖的位置';
-  map.querySelector('img')?.remove();
-  map.prepend(full);
-  setLocatorFrame(map, locator);
-  map.querySelector('.locator-frame').hidden = false;
-  el('locator-dialog').showModal();
+el('locator-open').onclick = () => showLocatorDialog('overview');
+el('locator-region-open').onclick = () => showLocatorDialog('region');
+el('locator-dialog-overview').onclick = () => showLocatorDialog('overview');
+el('locator-dialog-region').onclick = () => showLocatorDialog('region');
+el('locator-region-retry').onclick = () => {
+  if (regionPackState.get(currentRegionPack()) !== 'failed') return;
+  regionPackState.delete(currentRegionPack());
+  void loadRegionPack();
+  showLocator();
 };
 el('choices').addEventListener('change', event => {
   const decision = event.target.value;

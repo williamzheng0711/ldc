@@ -156,11 +156,9 @@
   .caption { font-size: .82rem; color: #d1dde4; }
   .locator {
     grid-area: 1 / 2;
-    display: grid;
-    grid-template-columns: minmax(0, min(43%, 176px)) minmax(0, 1fr);
-    align-items: center;
+    --locator-thumb-height: clamp(82px, 11vw, 126px);
     align-self: start;
-    gap: 12px;
+    min-width: 0;
     margin: clamp(18px, 3.5vw, 32px) clamp(18px, 3.5vw, 32px) 0;
     padding: 8px;
     border: 1px solid #495564;
@@ -168,10 +166,25 @@
     background: #222d39;
     color: #e7edf2;
   }
-  .locator-open { display: block; width: 100%; min-height: 0; padding: 0; overflow: hidden; }
-  .locator-open:enabled:hover { border-color: #ffdc68; }
-  .locator-title { margin-bottom: 3px; font-size: .88rem; font-weight: 680; }
+  .locator-thumbs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .locator-open {
+    min-width: 0;
+    width: 100%;
+    min-height: 0;
+    padding: 0;
+    overflow: hidden;
+    color: #e7edf2;
+    background: #17202a;
+    border-color: #495564;
+  }
+  .locator-open:enabled:hover { border-color: #ffdc68; background: #263240; }
+  .locator-open:disabled { opacity: .8; }
+  .locator-preview { height: var(--locator-thumb-height); display: grid; place-items: center; overflow: hidden; }
+  .locator-preview .locator-map { width: min(100%, calc(var(--locator-thumb-height) * var(--locator-ratio, 1))); }
+  .locator-title { display: block; padding: 4px 8px; font-size: .82rem; font-weight: 680; }
   .locator-copy { color: #d1dde4; font-size: .79rem; line-height: 1.45; }
+  .locator-status { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 6px; }
+  .locator-status button { min-height: 30px; padding: 3px 8px; font-size: .78rem; }
   .locator-map { position: relative; display: block; width: 100%; overflow: hidden; background: #17202a; }
   .locator-map img { display: block; width: 100%; height: 100%; }
   .locator-frame {
@@ -196,6 +209,8 @@
   .locator-dialog::backdrop { background: #15212bc2; }
   .locator-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
   .locator-dialog h2 { font-size: 1.13rem; }
+  .locator-dialog-switch { display: flex; gap: 6px; margin-block: 0 12px; }
+  .locator-dialog-switch [aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
   .locator-dialog .locator-map { max-width: min(100%, var(--locator-fit)); margin-inline: auto; border-radius: 4px; }
   .locator-dialog .locator-frame { border-width: 3px; }
   .locator-dialog p { margin-top: 8px; color: var(--muted); font-size: .85rem; }
@@ -274,7 +289,7 @@
     .workspace:has(.locator:not([hidden])) .image-box { width: min(var(--image-width, 100%), 40svh); }
     .locator {
       grid-area: 2 / 1;
-      grid-template-columns: minmax(0, 130px) minmax(0, 1fr);
+      --locator-thumb-height: 86px;
       margin: 0;
       padding: 3px 12px 10px;
       border: 0;
@@ -348,12 +363,19 @@
         </div>
       </section>
       <div class="locator" id="locator" hidden>
-        <button type="button" class="locator-open" id="locator-open" aria-label="放大整圖定位" aria-haspopup="dialog" disabled>
-          <span class="locator-map" id="locator-map"><span class="locator-frame" aria-hidden="true" hidden></span></span>
-        </button>
-        <div>
-          <p class="locator-title">整圖定位</p>
+        <div class="locator-thumbs">
+          <button type="button" class="locator-open" id="locator-open" aria-label="放大整圖定位" aria-haspopup="dialog" disabled>
+            <span class="locator-preview"><span class="locator-map" id="locator-map"><span class="locator-frame" aria-hidden="true" hidden></span></span></span>
+            <span class="locator-title">整圖</span>
+          </button>
+          <button type="button" class="locator-open" id="locator-region-open" aria-label="放大局部定位" aria-haspopup="dialog" disabled>
+            <span class="locator-preview"><span class="locator-map" id="locator-region-map"><span class="locator-frame" aria-hidden="true" hidden></span></span></span>
+            <span class="locator-title">局部</span>
+          </button>
+        </div>
+        <div class="locator-status">
           <p class="locator-copy" id="locator-copy" role="status"></p>
+          <button type="button" id="locator-region-retry" hidden>重試局部定位</button>
         </div>
       </div>
       <section class="form" aria-label="填寫判讀">
@@ -389,14 +411,18 @@
 </main>
 <dialog class="locator-dialog" id="locator-dialog" aria-labelledby="locator-title">
   <div class="locator-dialog-header">
-    <h2 id="locator-title">整圖定位</h2>
+    <h2 id="locator-title">影像定位</h2>
     <form method="dialog"><button type="submit" autofocus>關閉</button></form>
   </div>
+  <div class="locator-dialog-switch" role="group" aria-label="定位層級">
+    <button type="button" id="locator-dialog-overview" aria-pressed="true">整圖</button>
+    <button type="button" id="locator-dialog-region" aria-pressed="false">局部</button>
+  </div>
   <div class="locator-map" id="locator-large"><span class="locator-frame" aria-hidden="true" hidden></span></div>
-  <p>黃框標出本題小圖的範圍。</p>
+  <p id="locator-dialog-caption"></p>
 </dialog>
 <script src="./outline.js?v=3" defer></script>
 <script src="./viewport.js?v=1" defer></script>
-<script src="./review.js?v=500" defer></script>
+<script src="./review.js?v=501" defer></script>
 </body>
 </html>
