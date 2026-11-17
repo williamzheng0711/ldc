@@ -130,7 +130,7 @@ function saveAnswer(questionIndex) {
 async function readBundle(reviewKey) {
   let bytes;
   try {
-    const response = await fetch('./review-data.bin?v=300', {credentials: 'omit', mode: 'same-origin', cache: 'no-cache'});
+    const response = await fetch('./review-data.bin?v=500', {credentials: 'omit', mode: 'same-origin', cache: 'no-cache'});
     if (!response.ok) throw new Error();
     bytes = new Uint8Array(await response.arrayBuffer());
   } catch {
@@ -157,7 +157,7 @@ async function readBundle(reviewKey) {
 }
 
 async function readEstimates(reviewKey) {
-  const response = await fetch('./review-outlines.bin?v=1', {
+  const response = await fetch('./review-outlines.bin?v=2', {
     credentials: 'omit', mode: 'same-origin', cache: 'no-cache',
   });
   if (!response.ok) throw new Error();
