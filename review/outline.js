@@ -1,6 +1,9 @@
 'use strict';
 
 const OUTLINE_MAX_POINTS = 256;
+const OUTLINE_DOT_RADIUS = 4.5;
+const OUTLINE_MOUSE_PICK_RADIUS = 8;
+const OUTLINE_TOUCH_PICK_RADIUS = 12;
 
 function validOutline(points, tile) {
   return Array.isArray(points) && points.length >= 3 && points.length <= OUTLINE_MAX_POINTS &&
@@ -84,8 +87,8 @@ class OutlineEditor {
         this.handles.append(handle);
       }
       handle.setAttribute('transform', `translate(${x} ${y})`);
-      handle.firstChild.setAttribute('r', 10 / scale);
-      handle.lastChild.setAttribute('r', 3.2 / scale);
+      handle.firstChild.setAttribute('r', OUTLINE_TOUCH_PICK_RADIUS / scale);
+      handle.lastChild.setAttribute('r', OUTLINE_DOT_RADIUS / scale);
     });
   }
 
@@ -104,7 +107,7 @@ class OutlineEditor {
     if (!this.points || this.drag || event.button !== 0) return;
     const cursor = this.pointerPosition(event);
     const scale = this.svg.getBoundingClientRect().width / this.tile.width;
-    const radius = event.pointerType === 'touch' ? 10 : 5;
+    const radius = event.pointerType === 'touch' ? OUTLINE_TOUCH_PICK_RADIUS : OUTLINE_MOUSE_PICK_RADIUS;
     let index = -1;
     let best = radius / scale;
     this.points.forEach(([x, y], i) => {
