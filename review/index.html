@@ -140,7 +140,6 @@
     cursor: grab;
   }
   .outline-vertex:active { cursor: grabbing; }
-  .outline.adding .outline-vertex { cursor: crosshair; }
   .outline-vertex:focus-visible { outline: none; }
   .outline-vertex:focus-visible .outline-dot { fill: #fff; stroke-width: 2.5; }
   .outline-tools {
@@ -153,7 +152,6 @@
     font-size: .82rem;
   }
   .outline-tools button { min-height: 34px; padding: 5px 9px; }
-  .outline-tools button[aria-pressed="true"] { background: #ffdc68; color: #1a222c; }
   .image-status { color: #dfedf1; font-size: .88rem; text-align: center; padding: 8px 0; }
   .caption { font-size: .82rem; color: #d1dde4; }
   .locator {
@@ -344,8 +342,8 @@
         </div>
         <div class="outline-tools" id="outline-tools" hidden>
           <p id="outline-help" role="status"></p>
-          <button id="outline-add" type="button" aria-pressed="false" hidden>新增頂點</button>
-          <button id="outline-reset" type="button" hidden>還原估計輪廓</button>
+          <button id="outline-undo" type="button" disabled hidden>復原上一步</button>
+          <button id="outline-reset" type="button" disabled hidden>還原估計輪廓</button>
           <button id="outline-retry" type="button" hidden>重新載入輪廓</button>
         </div>
       </section>
@@ -397,8 +395,8 @@
   <div class="locator-map" id="locator-large"><span class="locator-frame" aria-hidden="true" hidden></span></div>
   <p>黃框標出本題小圖的範圍。</p>
 </dialog>
-<script src="./outline.js?v=2" defer></script>
+<script src="./outline.js?v=3" defer></script>
 <script src="./viewport.js?v=1" defer></script>
-<script src="./review.js?v=302" defer></script>
+<script src="./review.js?v=303" defer></script>
 </body>
 </html>

@@ -41,6 +41,7 @@ class OutlineEditor {
     this.svg.append(this.shape, this.edge, this.handles);
     this.svg.setAttribute('hidden', '');
     this.svg.addEventListener('pointerdown', event => this.startDrag(event));
+    this.svg.addEventListener('dblclick', event => this.addOnEdge(event));
     this.svg.addEventListener('pointermove', event => this.move(event));
     for (const type of ['pointerup', 'pointercancel']) {
       this.svg.addEventListener(type, event => this.finishDrag(event));
@@ -62,11 +63,6 @@ class OutlineEditor {
     this.points = points;
     this.svg.toggleAttribute('hidden', !points);
     if (points) this.paint();
-  }
-
-  setAdding(adding) {
-    this.adding = adding;
-    this.svg.classList.toggle('adding', adding);
   }
 
   paint() {
@@ -107,42 +103,50 @@ class OutlineEditor {
   startDrag(event) {
     if (!this.points || this.drag || event.button !== 0) return;
     const cursor = this.pointerPosition(event);
-    const distance = ([x, y]) => Math.hypot(x - cursor[0], y - cursor[1]);
     const scale = this.svg.getBoundingClientRect().width / this.tile.width;
     const radius = event.pointerType === 'touch' ? 10 : 5;
     let index = -1;
     let best = radius / scale;
-    const original = this.points;
-    if (!this.adding) {
-      original.forEach((point, i) => {
-        const current = distance(point);
-        if (current <= best) { best = current; index = i; }
-      });
-    }
-    if (index < 0) {
-      if (original.length >= OUTLINE_MAX_POINTS) return;
-      let projected;
-      best = 10 / scale;
-      original.forEach((start, i) => {
-        const point = nearestOnSegment(cursor, start, original[(i + 1) % original.length]);
-        const current = distance(point);
-        if (current <= best) { best = current; index = i + 1; projected = point; }
-      });
-      if (index < 0) return;
-      const start = original[index - 1];
-      const end = original[index % original.length];
-      if (projected.every((value, axis) => value === start[axis]) ||
-          projected.every((value, axis) => value === end[axis])) {
-        projected = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
-      }
-      this.points = original.slice();
-      this.points.splice(index, 0, this.boundedPoint(...projected));
-      this.paint();
-    }
-    const [x, y] = this.points[index];
-    this.drag = {id: event.pointerId, index, original, cursor, x, y};
+    this.points.forEach(([x, y], i) => {
+      const distance = Math.hypot(x - cursor[0], y - cursor[1]);
+      if (distance <= best) { best = distance; index = i; }
+    });
+    if (index < 0) return;
+    this.drag = {id: event.pointerId, index, original: this.points, cursor, threshold: 3 / scale};
     this.svg.classList.add('is-dragging');
     this.svg.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  addOnEdge(event) {
+    if (!this.points || this.drag || event.button !== 0 || this.points.length >= OUTLINE_MAX_POINTS) return;
+    const cursor = this.pointerPosition(event);
+    const distanceToCursor = ([x, y]) => Math.hypot(x - cursor[0], y - cursor[1]);
+    const scale = this.svg.getBoundingClientRect().width / this.tile.width;
+    if (this.points.some(point => distanceToCursor(point) <= 5 / scale)) return;
+
+    let index = -1;
+    let projected;
+    let best = 10 / scale;
+    this.points.forEach((start, i) => {
+      const end = this.points[(i + 1) % this.points.length];
+      const point = nearestOnSegment(cursor, start, end);
+      const distance = distanceToCursor(point);
+      if (distance > best) return;
+      best = distance;
+      index = i + 1;
+      projected = point;
+    });
+    if (index < 0) return;
+    const point = this.boundedPoint(...projected);
+    const start = this.points[index - 1];
+    const end = this.points[index % this.points.length];
+    if ([start, end].some(endpoint => endpoint.every((value, axis) => value === point[axis]))) return;
+
+    this.points = this.points.slice();
+    this.points.splice(index, 0, point);
+    this.paint();
+    this.onEdit(this.points);
     event.preventDefault();
   }
 
@@ -150,7 +154,11 @@ class OutlineEditor {
     const drag = this.drag;
     if (!drag || drag.id !== event.pointerId) return;
     const [x, y] = this.pointerPosition(event);
-    const next = this.boundedPoint(drag.x + x - drag.cursor[0], drag.y + y - drag.cursor[1]);
+    const dx = x - drag.cursor[0];
+    const dy = y - drag.cursor[1];
+    if (this.points === drag.original && Math.hypot(dx, dy) < drag.threshold) return;
+    const [originalX, originalY] = drag.original[drag.index];
+    const next = dx || dy ? this.boundedPoint(originalX + dx, originalY + dy) : drag.original[drag.index];
     const current = this.points[drag.index];
     if (current[0] === next[0] && current[1] === next[1]) return;
     this.points = this.points.slice();
@@ -164,9 +172,9 @@ class OutlineEditor {
     this.drag = null;
     this.svg.classList.remove('is-dragging');
     if (event.type === 'pointerup') {
-      const changed = this.points.length !== drag.original.length || this.points.some(
-        ([x, y], i) => x !== drag.original[i][0] || y !== drag.original[i][1]);
-      if (changed) this.onEdit(this.points);
+      const [x, y] = this.points[drag.index];
+      const [originalX, originalY] = drag.original[drag.index];
+      if (x !== originalX || y !== originalY) this.onEdit(this.points);
     } else {
       this.points = drag.original;
       this.paint();
@@ -189,8 +197,11 @@ class OutlineEditor {
     } else if (Object.hasOwn(shifts, event.key)) {
       const [dx, dy] = shifts[event.key];
       const step = event.shiftKey ? 5 : 1;
+      const next = this.boundedPoint(x + step * dx, y + step * dy);
+      event.preventDefault();
+      if (next[0] === x && next[1] === y) return;
       this.points = this.points.slice();
-      this.points[index] = this.boundedPoint(x + step * dx, y + step * dy);
+      this.points[index] = next;
       this.paint();
     } else {
       return;

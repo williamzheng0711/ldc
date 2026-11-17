@@ -11,6 +11,7 @@ const outlineMagic = encoder.encode('LDCOUT01');
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const images = new Map();
 const failedTiles = new Set();
+const outlineHistory = new Map();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
 let estimates = null, editor = null, viewport = null, loadingEstimates = false;
@@ -300,12 +301,21 @@ function imageURL(path) {
   return url;
 }
 
-function setAdding(adding) {
-  editor?.setAdding(adding);
-  el('outline-add').setAttribute('aria-pressed', String(adding));
-  el('outline-help').textContent = adding
-    ? '點一下輪廓邊緣新增頂點。'
-    : '拖曳頂點調整輪廓，或點選輪廓邊緣新增頂點。';
+function applyOutline(points) {
+  if (points === undefined) delete records[index].outline;
+  else records[index].outline = points;
+  showOutline();
+  saveAnswer(index);
+}
+
+function changeOutline(points) {
+  let history = outlineHistory.get(index);
+  if (!history) {
+    history = [];
+    outlineHistory.set(index, history);
+  }
+  history.push(records[index].outline);
+  applyOutline(points);
 }
 
 function showOutline() {
@@ -315,15 +325,16 @@ function showOutline() {
   const estimate = visible ? estimates?.[tile.id] : null;
   const draft = visible ? records[index].outline : null;
   const points = draft ?? estimate;
-  setAdding(false);
   editor?.setPoints(points);
-  el('outline-add').hidden = !points;
-  el('outline-reset').hidden = !draft || !estimate;
+  el('outline-undo').hidden = !points;
+  el('outline-undo').disabled = !points || !outlineHistory.get(index)?.length;
+  el('outline-reset').hidden = !estimate;
+  el('outline-reset').disabled = !draft;
   el('outline-retry').hidden = !visible || Boolean(estimate);
   el('outline-retry').disabled = loadingEstimates;
-  if (visible && !points) {
-    el('outline-help').textContent = loadingEstimates ? '正在載入輪廓…' : '暫時無法載入估計輪廓。';
-  }
+  el('outline-help').textContent = points
+    ? '雙擊邊界新增頂點，拖曳頂點調整輪廓。'
+    : loadingEstimates ? '正在載入輪廓…' : '暫時無法載入估計輪廓。';
   return points;
 }
 
@@ -378,10 +389,7 @@ function showImage() {
     el('note').disabled = false;
     editor = new OutlineEditor(layer, tile, points => {
       if (request !== imageRequest || records[index].decision !== 'correct') return;
-      records[index].outline = points;
-      el('outline-reset').hidden = !estimates?.[tile.id];
-      setAdding(false);
-      saveAnswer(index);
+      changeOutline(points);
     });
     viewport = new ImageViewport(box, layer, tile, renderZoom);
     const points = showOutline();
@@ -508,12 +516,11 @@ el('choices').addEventListener('change', event => {
 el('zoom-out').onclick = () => viewport?.zoomAt(viewport.zoom / 1.3);
 el('zoom-in').onclick = () => viewport?.zoomAt(viewport.zoom * 1.3);
 el('zoom-reset').onclick = () => viewport?.reset();
-el('outline-add').onclick = () => setAdding(el('outline-add').getAttribute('aria-pressed') !== 'true');
-el('outline-reset').onclick = () => {
-  delete records[index].outline;
-  showOutline();
-  saveAnswer(index);
+el('outline-undo').onclick = () => {
+  const history = outlineHistory.get(index);
+  if (history?.length) applyOutline(history.pop());
 };
+el('outline-reset').onclick = () => changeOutline(undefined);
 el('outline-retry').onclick = async () => {
   const requestedImage = imageRequest;
   loadingEstimates = true;
