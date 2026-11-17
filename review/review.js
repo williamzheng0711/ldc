@@ -13,7 +13,7 @@ const images = new Map();
 const failedTiles = new Set();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
-let estimates = null, editor = null, loadingEstimates = false;
+let estimates = null, editor = null, viewport = null, loadingEstimates = false;
 let saveQueue = Promise.resolve();
 
 function saveStatus(message, attention = false) {
@@ -324,13 +324,25 @@ function showOutline() {
   if (visible && !points) {
     el('outline-help').textContent = loadingEstimates ? '正在載入輪廓…' : '暫時無法載入估計輪廓。';
   }
+  return points;
+}
+
+function renderZoom(zoom) {
+  el('zoom-value').textContent = `${Math.round(zoom * 100)}%`;
+  el('zoom-out').disabled = zoom === 1;
+  el('zoom-reset').disabled = zoom === 1;
+  el('zoom-in').disabled = zoom === MAX_IMAGE_ZOOM;
+  if (editor?.points) editor.paint();
 }
 
 function showImage() {
   const tile = tiles[index];
   const request = ++imageRequest;
+  viewport?.destroy();
+  viewport = null;
   editor = null;
   el('outline-tools').hidden = true;
+  el('zoom-tools').hidden = true;
   el('choices').disabled = true;
   el('note').disabled = true;
   el('image-status').textContent = '正在載入影像…';
@@ -340,6 +352,8 @@ function showImage() {
   const box = document.createElement('div');
   box.className = 'image-box';
   box.style.aspectRatio = `${tile.width} / ${tile.height}`;
+  const layer = document.createElement('div');
+  layer.className = 'image-layer';
   const target = document.createElement('span');
   target.className = 'target';
   target.setAttribute('aria-hidden', 'true');
@@ -353,28 +367,34 @@ function showImage() {
   image.alt = '本題的骨髓小圖，藍色短線指向要判斷的位置';
   image.width = tile.width;
   image.height = tile.height;
+  image.draggable = false;
   image.addEventListener('load', () => {
     if (request !== imageRequest) return;
     el('image-slot').replaceChildren(box);
     el('image-status').hidden = true;
     el('caption').hidden = false;
+    el('zoom-tools').hidden = false;
     el('choices').disabled = false;
     el('note').disabled = false;
-    editor = new OutlineEditor(box, tile, points => {
+    editor = new OutlineEditor(layer, tile, points => {
       if (request !== imageRequest || records[index].decision !== 'correct') return;
       records[index].outline = points;
       el('outline-reset').hidden = !estimates?.[tile.id];
       setAdding(false);
       saveAnswer(index);
     });
-    showOutline();
+    viewport = new ImageViewport(box, layer, tile, renderZoom);
+    const points = showOutline();
+    if (records[index].decision === 'correct') viewport.focus(points);
+    renderZoom(viewport.zoom);
   });
   image.addEventListener('error', () => {
     if (request !== imageRequest) return;
     el('image-status').textContent = '無法載入這張影像，請重試。';
     el('retry-image').hidden = false;
   });
-  box.append(image, target);
+  layer.append(image, target);
+  box.append(layer);
   el('image-slot').replaceChildren();
   image.src = imageURL(tile.raw);
 }
@@ -470,16 +490,24 @@ el('locator-open').onclick = () => {
 };
 el('choices').addEventListener('change', event => {
   const decision = event.target.value;
-  if (!validDecisions.has(decision) || decision === records[index].decision) return;
+  const previous = records[index].decision;
+  if (!validDecisions.has(decision) || decision === previous) return;
   records[index].decision = decision;
-  showOutline();
-  if (decision === 'correct' && window.matchMedia('(max-width: 710px)').matches) {
-    const target = editor?.svg.hasAttribute('hidden') ? el('outline-tools') : editor?.svg;
-    target?.scrollIntoView({block: 'nearest'});
+  const points = showOutline();
+  if (decision === 'correct') {
+    viewport?.focus(points);
+    if (window.matchMedia('(max-width: 710px)').matches) {
+      viewport?.box.scrollIntoView({block: 'nearest'});
+    }
+  } else if (previous === 'correct') {
+    viewport?.reset();
   }
   renderProgress();
   saveAnswer(index);
 });
+el('zoom-out').onclick = () => viewport?.zoomAt(viewport.zoom / 1.3);
+el('zoom-in').onclick = () => viewport?.zoomAt(viewport.zoom * 1.3);
+el('zoom-reset').onclick = () => viewport?.reset();
 el('outline-add').onclick = () => setAdding(el('outline-add').getAttribute('aria-pressed') !== 'true');
 el('outline-reset').onclick = () => {
   delete records[index].outline;
@@ -487,6 +515,7 @@ el('outline-reset').onclick = () => {
   saveAnswer(index);
 };
 el('outline-retry').onclick = async () => {
+  const requestedImage = imageRequest;
   loadingEstimates = true;
   showOutline();
   try {
@@ -495,7 +524,8 @@ el('outline-retry').onclick = async () => {
     estimates = null;
   } finally {
     loadingEstimates = false;
-    showOutline();
+    const points = showOutline();
+    if (requestedImage === imageRequest && points) viewport?.focus(points);
   }
 };
 el('note').oninput = event => {

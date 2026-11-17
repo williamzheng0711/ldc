@@ -42,15 +42,23 @@ class OutlineEditor {
     this.svg.setAttribute('hidden', '');
     this.svg.addEventListener('pointerdown', event => this.startDrag(event));
     this.svg.addEventListener('pointermove', event => this.move(event));
-    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    for (const type of ['pointerup', 'pointercancel']) {
       this.svg.addEventListener(type, event => this.finishDrag(event));
     }
+    this.svg.addEventListener('lostpointercapture', event => {
+      const drag = this.drag;
+      // A click can report capture loss immediately before its pointerup.
+      requestAnimationFrame(() => {
+        if (this.drag === drag) this.finishDrag(event);
+      });
+    });
     this.handles.addEventListener('keydown', event => this.editByKey(event));
     box.append(this.svg);
   }
 
   setPoints(points) {
     this.drag = null;
+    this.svg.classList.remove('is-dragging');
     this.points = points;
     this.svg.toggleAttribute('hidden', !points);
     if (points) this.paint();
@@ -133,6 +141,7 @@ class OutlineEditor {
     }
     const [x, y] = this.points[index];
     this.drag = {id: event.pointerId, index, original, cursor, x, y};
+    this.svg.classList.add('is-dragging');
     this.svg.setPointerCapture(event.pointerId);
     event.preventDefault();
   }
@@ -153,6 +162,7 @@ class OutlineEditor {
     const drag = this.drag;
     if (!drag || drag.id !== event.pointerId) return;
     this.drag = null;
+    this.svg.classList.remove('is-dragging');
     if (event.type === 'pointerup') {
       const changed = this.points.length !== drag.original.length || this.points.some(
         ([x, y], i) => x !== drag.original[i][0] || y !== drag.original[i][1]);
