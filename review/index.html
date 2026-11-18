@@ -153,6 +153,7 @@
   }
   .outline-tools button { min-height: 34px; padding: 5px 9px; }
   .image-status { color: #dfedf1; font-size: .88rem; text-align: center; padding: 8px 0; }
+  .image-download { display: block; inline-size: min(75%, 260px); block-size: 10px; accent-color: #6bdac7; }
   .caption { font-size: .82rem; color: #d1dde4; }
   .locator {
     grid-area: 1 / 2;
@@ -347,6 +348,7 @@
       <section class="viewer" aria-label="影像與定位">
         <div id="image-slot" class="image-slot"></div>
         <p class="image-status" id="image-status" role="status"></p>
+        <progress class="image-download" id="image-download" aria-label="本題影像下載進度" max="100" hidden></progress>
         <button id="retry-image" type="button" hidden>重新載入影像</button>
         <p class="caption" id="caption" hidden>圖內可用滾輪或觸控板縮放。放大後拖曳影像可移動視野。</p>
         <div class="zoom-tools" id="zoom-tools" role="group" aria-label="影像縮放" hidden>
@@ -423,6 +425,6 @@
 </dialog>
 <script src="./outline.js?v=4" defer></script>
 <script src="./viewport.js?v=1" defer></script>
-<script src="./review.js?v=503" defer></script>
+<script src="./review.js?v=504" defer></script>
 </body>
 </html>

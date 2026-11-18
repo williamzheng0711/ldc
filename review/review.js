@@ -157,16 +157,19 @@ async function readIndex(reviewKey) {
   }
 }
 
-async function readEncryptedSidecar(path, expectedHeader, reviewKey, signal, bindPath = false) {
+async function readEncryptedSidecar(path, expectedHeader, reviewKey, signal) {
   const response = await fetch(path, {
     credentials: 'omit', mode: 'same-origin', signal,
   });
   if (!response.ok) throw new Error();
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  return decryptPacket(new Uint8Array(await response.arrayBuffer()), expectedHeader, reviewKey);
+}
+
+function decryptPacket(bytes, expectedHeader, reviewKey, path = '') {
   const header = bytes.subarray(0, expectedHeader.length);
   if (bytes.length < 40 || !expectedHeader.every((value, i) => value === header[i])) throw new Error();
   let additionalData = header;
-  if (bindPath) {
+  if (path) {
     const binding = encoder.encode(path);
     additionalData = new Uint8Array(header.length + binding.length);
     additionalData.set(header);
@@ -213,14 +216,80 @@ function parseAssetBundle(plaintext, allowedPath) {
   return {metadata, contents};
 }
 
-async function readImage(folder, questionIndex, controller = new AbortController()) {
-  const path = './images-v1/' + folder + '/' + String(questionIndex + 1).padStart(3, '0') + '.bin';
-  const timeout = setTimeout(() => controller.abort(), 30000);
+async function downloadImagePacket(path, signal, onProgress, retry = false) {
+  const connection = new AbortController();
+  const cancel = () => connection.abort();
+  let timeout;
+  function resetTimeout() {
+    clearTimeout(timeout);
+    timeout = setTimeout(cancel, 30000);
+  }
+  signal.addEventListener('abort', cancel, {once: true});
+  if (signal.aborted) cancel();
   try {
-    return await readEncryptedSidecar(path, imageMagic, key, controller.signal, true);
+    resetTimeout();
+    const response = await fetch(path, {
+      credentials: 'omit', mode: 'same-origin', signal: connection.signal,
+      cache: retry ? 'reload' : 'default',
+    });
+    if (!response.ok) {
+      const error = new Error('Image download failed');
+      error.status = response.status;
+      throw error;
+    }
+    resetTimeout();
+    if (!response.body) return new Uint8Array(await response.arrayBuffer());
+    const total = Number(response.headers.get('Content-Length'));
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      resetTimeout();
+      chunks.push(value);
+      received += value.byteLength;
+      onProgress(received, total);
+    }
+    const bytes = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
   } finally {
     clearTimeout(timeout);
+    signal.removeEventListener('abort', cancel);
   }
+}
+
+async function readImage(folder, questionIndex, controller = new AbortController()) {
+  const path = './images-v1/' + folder + '/' + String(questionIndex + 1).padStart(3, '0') + '.bin';
+  const isCurrent = () => folder !== 'overview' && questionIndex === index;
+  function showProgress(received, total) {
+    if (!isCurrent() || controller.signal.aborted) return;
+    const percent = total > 0 ? Math.min(100, received / total * 100) : null;
+    if (percent !== null) el('image-download').value = percent;
+    const progress = percent !== null
+      ? Math.floor(percent / 5) * 5 + '%'
+      : Math.floor(received / 16384) * 16 + ' KB';
+    const status = el('image-status');
+    const message = '正在下載影像：' + progress;
+    if (status.textContent !== message) status.textContent = message;
+  }
+  let bytes;
+  try {
+    bytes = await downloadImagePacket(path, controller.signal, showProgress);
+  } catch (error) {
+    const transient = error.name === 'AbortError' || error.name === 'TypeError' ||
+      error.status === 408 || error.status >= 500;
+    if (!transient || controller.signal.aborted || !isCurrent()) throw error;
+    el('image-download').removeAttribute('value');
+    el('image-status').textContent = '影像下載中斷，正在重試…';
+    bytes = await downloadImagePacket(path, controller.signal, showProgress, true);
+  }
+  return decryptPacket(bytes, imageMagic, key, path);
 }
 
 function loadCrop(questionIndex) {
@@ -449,6 +518,9 @@ async function showImage() {
   el('note').disabled = true;
   el('image-status').textContent = '正在載入影像…';
   el('image-status').hidden = false;
+  const progress = el('image-download');
+  progress.removeAttribute('value');
+  progress.hidden = false;
   el('caption').hidden = true;
   el('retry-image').hidden = true;
   el('locator').hidden = true;
@@ -462,11 +534,14 @@ async function showImage() {
     body = await loadCrop(questionIndex);
   } catch {
     if (request !== imageRequest) return;
+    progress.hidden = true;
     el('image-status').textContent = '無法下載本題影像，請重試。';
     el('retry-image').hidden = false;
     return;
   }
   if (request !== imageRequest) return;
+  progress.value = 100;
+  el('image-status').textContent = '正在顯示影像…';
   const box = document.createElement('div');
   box.className = 'image-box';
   box.style.aspectRatio = `${tile.width} / ${tile.height}`;
@@ -490,6 +565,7 @@ async function showImage() {
     if (request !== imageRequest) return;
     el('image-slot').replaceChildren(box);
     el('image-status').hidden = true;
+    progress.hidden = true;
     el('caption').hidden = false;
     el('zoom-tools').hidden = false;
     el('choices').disabled = false;
@@ -509,6 +585,7 @@ async function showImage() {
   image.addEventListener('error', () => {
     if (request !== imageRequest) return;
     cropCache.delete(questionIndex);
+    progress.hidden = true;
     el('image-status').textContent = '無法載入這張影像，請重試。';
     el('retry-image').hidden = false;
   });
