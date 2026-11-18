@@ -14,15 +14,15 @@ const imagesPerDirectory = 20;
 const ahead = 10;
 const behind = 2;
 const locatorAhead = 3;
-const locatorConcurrency = 3;
+const prefetchConcurrency = 3;
 const locatorCacheLimit = 32;
-const cropConcurrency = 3;
 const cropCacheLimit = 24;
 const regionPath = /^\/images\/region-SD[0-9]{3}\.webp$/;
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const locatorCache = new Map();
 const cropRequests = new Map();
 const cropCache = new Map();
+const cropFailures = new Set();
 const overviewNumbers = new Map();
 const locatorRequests = new Map();
 const locatorFailures = new Set();
@@ -32,8 +32,9 @@ let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
 let estimates = null, editor = null, viewport = null, loadingEstimates = false;
 let estimateRequest;
-let cropWindow = {order: [], failures: new Set()};
-let locatorWindow = new Map();
+let cropWindow = new Set();
+let locatorWindow = new Set();
+let prefetchQueue = [];
 let locatorDialogLevel = 'overview';
 let saveQueue = Promise.resolve();
 
@@ -316,43 +317,23 @@ function loadCrop(questionIndex) {
     cropCache.set(questionIndex, {image, url});
     if (cropCache.size > cropCacheLimit) {
       const evicted = [...cropCache.keys()].find(cachedIndex =>
-        cachedIndex !== index && !cropWindow.order.includes(cachedIndex));
+        cachedIndex !== index && !cropWindow.has(cachedIndex));
       if (evicted !== undefined) {
         URL.revokeObjectURL(cropCache.get(evicted).url);
         cropCache.delete(evicted);
       }
     }
     return cropCache.get(questionIndex);
+  }).catch(error => {
+    if (!controller.signal.aborted && cropWindow.has(questionIndex)) cropFailures.add(questionIndex);
+    throw error;
   }).finally(() => {
-    if (cropRequests.get(questionIndex)?.controller === controller) cropRequests.delete(questionIndex);
+    if (cropRequests.get(questionIndex)?.controller !== controller) return;
+    cropRequests.delete(questionIndex);
+    fillImageWindow();
   });
   cropRequests.set(questionIndex, {controller, promise});
   return promise;
-}
-
-function updateCropWindow(questionIndex) {
-  const order = [];
-  for (let offset = 1; offset <= ahead && questionIndex + offset < tiles.length; offset++) {
-    order.push(questionIndex + offset);
-  }
-  for (let offset = 1; offset <= behind && questionIndex >= offset; offset++) order.push(questionIndex - offset);
-  cropWindow = {order, failures: new Set()};
-  for (const [queuedIndex, request] of cropRequests) {
-    if (queuedIndex === questionIndex || order.includes(queuedIndex)) continue;
-    cropRequests.delete(queuedIndex);
-    request.controller.abort();
-  }
-}
-
-function fillCropWindow() {
-  if (!cropCache.has(index)) return;
-  for (const upcoming of cropWindow.order) {
-    if (cropRequests.size >= cropConcurrency) return;
-    if (cropCache.has(upcoming) || cropRequests.has(upcoming) || cropWindow.failures.has(upcoming)) continue;
-    void loadCrop(upcoming).catch(error => {
-      if (error?.name !== 'AbortError' || cropWindow.order.includes(upcoming)) cropWindow.failures.add(upcoming);
-    }).finally(fillCropWindow);
-  }
 }
 
 function regionAsset(tile) {
@@ -419,41 +400,66 @@ function loadLocatorAsset({kind, questionIndex, raw}) {
     locatorRequests.delete(raw);
     const current = tiles[index];
     if (!el('locator').hidden && (raw === current.locator.raw || raw === regionAsset(current))) showLocator();
-    fillLocatorWindow();
+    fillImageWindow();
   });
   locatorRequests.set(raw, {controller, promise});
   return promise;
 }
 
-function updateLocatorWindow(questionIndex) {
-  locatorWindow = new Map();
-  const nearby = [questionIndex];
-  for (let offset = 1; offset <= locatorAhead && questionIndex + offset < tiles.length; offset++) {
+function updateImageWindow(questionIndex, ready) {
+  const nearby = [];
+  for (let offset = 1; offset <= ahead && questionIndex + offset < tiles.length; offset++) {
     nearby.push(questionIndex + offset);
   }
   for (let offset = 1; offset <= behind && questionIndex >= offset; offset++) nearby.push(questionIndex - offset);
-  for (const next of nearby) {
+  cropWindow = new Set(nearby);
+  cropFailures.clear();
+  locatorWindow = new Set();
+  prefetchQueue = [];
+  const queueLocators = next => {
     for (const kind of ['overview', 'region']) {
       const job = locatorJob(kind, next);
-      if (!locatorWindow.has(job.raw)) locatorWindow.set(job.raw, job);
+      if (locatorWindow.has(job.raw)) continue;
+      locatorWindow.add(job.raw);
+      prefetchQueue.push(job);
     }
+  };
+  // Warm the next crop and the selected question's locators before the rest of the window.
+  const [next, ...remaining] = nearby;
+  if (next !== undefined) prefetchQueue.push({kind: 'crop', questionIndex: next});
+  queueLocators(questionIndex);
+  if (next !== undefined) queueLocators(next);
+  for (const upcoming of remaining) {
+    prefetchQueue.push({kind: 'crop', questionIndex: upcoming});
+    if (upcoming <= questionIndex + locatorAhead) queueLocators(upcoming);
+  }
+  // Keep an in-flight download of the selected crop and give it the connection on a miss.
+  for (const [queuedIndex, request] of cropRequests) {
+    if (queuedIndex === questionIndex || (ready && cropWindow.has(queuedIndex))) continue;
+    cropRequests.delete(queuedIndex);
+    request.controller.abort();
   }
   for (const raw of locatorFailures) {
     if (!locatorWindow.has(raw)) locatorFailures.delete(raw);
   }
   for (const [raw, request] of locatorRequests) {
-    if (locatorWindow.has(raw)) continue;
+    if (ready && locatorWindow.has(raw)) continue;
     locatorRequests.delete(raw);
     request.controller.abort();
   }
 }
 
-function fillLocatorWindow() {
-  if (el('locator').hidden) return;
-  for (const [raw, job] of locatorWindow) {
-    if (locatorRequests.size >= locatorConcurrency) return;
-    if (locatorCache.has(raw) || locatorRequests.has(raw) || locatorFailures.has(raw)) continue;
-    void loadLocatorAsset(job);
+function fillImageWindow() {
+  if (!viewport) return;
+  for (const job of prefetchQueue) {
+    if (cropRequests.size + locatorRequests.size >= prefetchConcurrency) return;
+    const {kind, questionIndex, raw} = job;
+    if (kind === 'crop') {
+      if (cropCache.has(questionIndex) || cropRequests.has(questionIndex) || cropFailures.has(questionIndex)) continue;
+      void loadCrop(questionIndex).catch(() => {});
+    } else if (!locatorCache.has(raw) && !locatorRequests.has(raw) && !locatorFailures.has(raw)) {
+      void loadLocatorAsset(job);
+    }
   }
 }
 
@@ -587,8 +593,8 @@ async function showImage() {
   const questionIndex = index;
   const tile = tiles[questionIndex];
   const request = ++imageRequest;
-  updateCropWindow(questionIndex);
-  updateLocatorWindow(questionIndex);
+  const ready = cropCache.has(questionIndex);
+  updateImageWindow(questionIndex, ready);
   viewport?.destroy();
   viewport = null;
   editor = null;
@@ -596,7 +602,6 @@ async function showImage() {
   el('zoom-tools').hidden = true;
   el('choices').disabled = true;
   el('note').disabled = true;
-  const ready = cropCache.has(questionIndex);
   el('image-status').textContent = ready ? '' : '正在載入影像…';
   el('image-status').hidden = ready;
   const progress = el('image-download');
@@ -604,7 +609,7 @@ async function showImage() {
   progress.hidden = ready;
   el('caption').hidden = true;
   el('retry-image').hidden = true;
-  el('locator').hidden = true;
+  showLocator();
   if (!ready) el('image-slot').replaceChildren();
   let crop;
   try {
@@ -645,13 +650,11 @@ async function showImage() {
     changeOutline(points);
   });
   viewport = new ImageViewport(box, layer, tile, renderZoom);
-  fillCropWindow();
   if (!estimateRequest) loadEstimates();
   const points = showOutline();
   if (records[index].decision === 'correct') viewport.focus(points);
   renderZoom(viewport.zoom);
-  showLocator();
-  fillLocatorWindow();
+  fillImageWindow();
 }
 
 function validLocatorBox(box) {
@@ -714,14 +717,13 @@ function showLocator() {
   const rawRegion = regionAsset(tiles[index]);
   el('locator-open').disabled = false;
   el('locator-region-open').disabled = false;
-  el('locator-overview-placeholder').textContent = locatorFailures.has(overview.raw) ? '點按重試' : '準備整圖…';
-  el('locator-region-placeholder').textContent = locatorFailures.has(rawRegion) ? '點按重試' : '準備局部…';
+  el('locator-overview-placeholder').textContent = locatorFailures.has(overview.raw) ? '點按重試' : '';
+  el('locator-region-placeholder').textContent = locatorFailures.has(rawRegion) ? '點按重試' : '';
   const failed = locatorFailures.has(overview.raw) || locatorFailures.has(rawRegion);
-  const loading = locatorRequests.has(overview.raw) || locatorRequests.has(rawRegion);
   el('locator-region-retry').hidden = !failed;
-  el('locator-copy').textContent = failed ? '部分定位縮圖未載入，請重試。' :
-    loading || !locatorCache.has(overview.raw) || !region ? '正在準備定位縮圖…' :
-    region ? '整圖黃框指向局部，局部黃框指向本題。' : '點選縮圖放大。';
+  const error = el('locator-error');
+  const message = failed ? '部分定位縮圖未載入，請重試。' : '';
+  if (error.textContent !== message) error.textContent = message;
   if (el('locator-dialog').open) showLocatorDialog(locatorDialogLevel);
 }
 
