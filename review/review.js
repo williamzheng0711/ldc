@@ -9,8 +9,7 @@ const decoder = new TextDecoder('utf-8', {fatal: true});
 const indexMagic = encoder.encode('LDCIDX01');
 const imageMagic = encoder.encode('LDCQIM01');
 const outlineMagic = encoder.encode('LDCOUT01');
-const regionMagic = encoder.encode('LDCCTX01');
-const regionsPerPack = 25;
+const regionMagic = encoder.encode('LDCRGN01');
 const imagesPerDirectory = 20;
 const ahead = 10;
 const behind = 2;
@@ -20,9 +19,9 @@ const images = new Map();
 const cropRequests = new Map();
 const cropCache = new Map();
 const overviewNumbers = new Map();
-const overviewRequests = new Set();
+const locatorRequests = new Map();
+const locatorFailures = new Set();
 const regions = new Map();
-const regionPackState = new Map();
 const failedTiles = new Set();
 const outlineHistory = new Map();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
@@ -198,25 +197,11 @@ function validTile(tile) {
       value < (dim === 0 ? tile.width : tile.height));
 }
 
-function parseAssetBundle(plaintext, allowedPath) {
-  const manifestLength = new DataView(plaintext).getUint32(0);
-  const bytes = new Uint8Array(plaintext);
-  let cursor = 4 + manifestLength;
-  if (cursor > bytes.length) throw new Error();
-  const metadata = JSON.parse(decoder.decode(bytes.subarray(4, cursor)));
-  if (!Array.isArray(metadata?.files)) throw new Error();
-  const contents = new Map();
-  for (const {path, length} of metadata.files) {
-    if (typeof path !== 'string' || !allowedPath.test(path) || contents.has(path) ||
-        !Number.isSafeInteger(length) || length <= 0 || length > bytes.length - cursor) throw new Error();
-    contents.set(path, bytes.subarray(cursor, cursor + length));
-    cursor += length;
-  }
-  if (cursor !== bytes.length) throw new Error();
-  return {metadata, contents};
+function cropFolder(questionIndex) {
+  return String(Math.floor(questionIndex / imagesPerDirectory) + 1).padStart(2, '0');
 }
 
-async function downloadImagePacket(path, signal, onProgress, retry = false) {
+async function downloadImagePacket(path, signal, onProgress, priority, retry = false) {
   const connection = new AbortController();
   const cancel = () => connection.abort();
   let timeout;
@@ -231,6 +216,7 @@ async function downloadImagePacket(path, signal, onProgress, retry = false) {
     const response = await fetch(path, {
       credentials: 'omit', mode: 'same-origin', signal: connection.signal,
       cache: retry ? 'reload' : 'default',
+      priority,
     });
     if (!response.ok) {
       const error = new Error('Image download failed');
@@ -264,9 +250,12 @@ async function downloadImagePacket(path, signal, onProgress, retry = false) {
   }
 }
 
-async function readImage(folder, questionIndex, controller = new AbortController()) {
-  const path = './images-v1/' + folder + '/' + String(questionIndex + 1).padStart(3, '0') + '.bin';
-  const isCurrent = () => folder !== 'overview' && questionIndex === index;
+async function readImage(folder, questionIndex, controller, kind = 'crop') {
+  const isRegion = kind === 'region';
+  const number = String(questionIndex + 1).padStart(3, '0');
+  const path = './assets-v2/' + folder + '/' + (isRegion ? 'region-' : '') + number + '.bin';
+  const isCurrent = () => kind === 'crop' && questionIndex === index;
+  const priority = isCurrent() ? 'high' : kind === 'crop' ? 'auto' : 'low';
   function showProgress(received, total) {
     if (!isCurrent() || controller.signal.aborted) return;
     const percent = total > 0 ? Math.min(100, received / total * 100) : null;
@@ -280,16 +269,16 @@ async function readImage(folder, questionIndex, controller = new AbortController
   }
   let bytes;
   try {
-    bytes = await downloadImagePacket(path, controller.signal, showProgress);
+    bytes = await downloadImagePacket(path, controller.signal, showProgress, priority);
   } catch (error) {
     const transient = error.name === 'AbortError' || error.name === 'TypeError' ||
       error.status === 408 || error.status >= 500;
     if (!transient || controller.signal.aborted || !isCurrent()) throw error;
     el('image-download').removeAttribute('value');
     el('image-status').textContent = '影像下載中斷，正在重試…';
-    bytes = await downloadImagePacket(path, controller.signal, showProgress, true);
+    bytes = await downloadImagePacket(path, controller.signal, showProgress, 'high', true);
   }
-  return decryptPacket(bytes, imageMagic, key, path);
+  return decryptPacket(bytes, isRegion ? regionMagic : imageMagic, key, path);
 }
 
 function loadCrop(questionIndex) {
@@ -301,7 +290,7 @@ function loadCrop(questionIndex) {
   }
   const pending = cropRequests.get(questionIndex);
   if (pending) return pending.promise;
-  const folder = String(Math.floor(questionIndex / imagesPerDirectory) + 1).padStart(2, '0');
+  const folder = cropFolder(questionIndex);
   const controller = new AbortController();
   const promise = readImage(folder, questionIndex, controller).then(body => {
     if (controller.signal.aborted) throw new Error();
@@ -327,8 +316,8 @@ function prefetchCrops(questionIndex, request) {
   const queue = [];
   for (let offset = 1; offset <= ahead; offset++) {
     if (questionIndex + offset < tiles.length) queue.push(questionIndex + offset);
-    if (offset <= behind && questionIndex - offset >= 0) queue.push(questionIndex - offset);
   }
+  for (let offset = 1; offset <= behind && questionIndex >= offset; offset++) queue.push(questionIndex - offset);
   async function download() {
     while (request === imageRequest && queue.length) {
       try {
@@ -339,34 +328,51 @@ function prefetchCrops(questionIndex, request) {
   for (let worker = 0; worker < 3; worker++) void download();
 }
 
-function currentRegionPack() {
-  return Math.floor(index / regionsPerPack);
+function regionAsset(tile) {
+  return '/images/region-' + tile.id + '.webp';
 }
 
-async function loadRegionPack() {
-  const pack = currentRegionPack();
-  if (regionPackState.has(pack)) return;
-  regionPackState.set(pack, 'loading');
-  try {
-    const file = './review-context-' + String(pack + 1).padStart(2, '0') + '.bin?v=1';
-    const plaintext = await readEncryptedSidecar(file, regionMagic, key);
-    const {metadata, contents} = parseAssetBundle(plaintext, regionPath);
-    const expected = tiles.slice(pack * regionsPerPack, (pack + 1) * regionsPerPack);
-    if (metadata.batch_id !== batch.batch_id || !metadata.regions ||
-        Object.keys(metadata.regions).length !== expected.length || contents.size !== expected.length ||
-        !expected.every(tile => {
-          if (!Object.hasOwn(metadata.regions, tile.id)) return false;
-          const entry = metadata.regions[tile.id];
-          return validLocator(entry, regionPath) && validLocatorBox(entry.whole_box) &&
-            entry.raw === '/images/region-' + tile.id + '.webp' && contents.has(entry.raw);
-        })) throw new Error();
-    for (const tile of expected) regions.set(tile.id, metadata.regions[tile.id]);
-    for (const [path, body] of contents) images.set(path, body);
-    regionPackState.set(pack, 'ready');
-  } catch {
-    regionPackState.set(pack, 'failed');
+function loadLocatorAsset(kind, questionIndex) {
+  const tile = tiles[questionIndex];
+  const isRegion = kind === 'region';
+  const raw = isRegion ? regionAsset(tile) : tile.locator.raw;
+  if (images.has(raw)) return Promise.resolve();
+  if (locatorRequests.has(raw)) return locatorRequests.get(raw).promise;
+  locatorFailures.delete(raw);
+  const controller = new AbortController();
+  const folder = isRegion ? cropFolder(questionIndex) : 'overview';
+  const number = isRegion ? questionIndex : overviewNumbers.get(raw);
+  const promise = readImage(folder, number, controller, kind).then(plaintext => {
+    if (controller.signal.aborted) return;
+    if (!isRegion) {
+      images.set(raw, plaintext);
+      return;
+    }
+    const bytes = new Uint8Array(plaintext);
+    const start = 4 + new DataView(plaintext).getUint32(0);
+    if (start >= bytes.length) throw new Error();
+    const region = JSON.parse(decoder.decode(bytes.subarray(4, start)));
+    if (!validLocator(region, regionPath) || region.raw !== raw ||
+        !validLocatorBox(region.whole_box)) throw new Error();
+    regions.set(tile.id, region);
+    images.set(raw, bytes.subarray(start));
+  }).catch(() => {
+    if (!controller.signal.aborted) locatorFailures.add(raw);
+  }).finally(() => {
+    if (locatorRequests.get(raw)?.controller !== controller) return;
+    locatorRequests.delete(raw);
+    if (!el('locator').hidden) showLocator();
+  });
+  locatorRequests.set(raw, {controller, promise});
+  return promise;
+}
+
+function cancelDistantLocators(tile) {
+  for (const [raw, request] of locatorRequests) {
+    if (raw === tile.locator.raw || raw === regionAsset(tile)) continue;
+    locatorRequests.delete(raw);
+    request.controller.abort();
   }
-  if (pack === currentRegionPack() && !el('locator').hidden) showLocator();
 }
 
 el('unlock-form').addEventListener('submit', async event => {
@@ -453,8 +459,7 @@ function renderProgress() {
 function imageURL(path) {
   const entry = images.get(path);
   if (typeof entry === 'string') return entry;
-  const type = regionPath.test(path) ? 'image/webp' : 'image/png';
-  const url = URL.createObjectURL(new Blob([entry], {type}));
+  const url = URL.createObjectURL(new Blob([entry], {type: 'image/webp'}));
   images.set(path, url);
   return url;
 }
@@ -509,6 +514,7 @@ async function showImage() {
   const tile = tiles[questionIndex];
   const request = ++imageRequest;
   cancelDistantCrops(questionIndex);
+  cancelDistantLocators(tile);
   viewport?.destroy();
   viewport = null;
   editor = null;
@@ -579,8 +585,10 @@ async function showImage() {
     const points = showOutline();
     if (records[index].decision === 'correct') viewport.focus(points);
     renderZoom(viewport.zoom);
-    showLocator();
     prefetchCrops(questionIndex, request);
+    void loadLocatorAsset('overview', questionIndex);
+    void loadLocatorAsset('region', questionIndex);
+    showLocator();
   });
   image.addEventListener('error', () => {
     if (request !== imageRequest) return;
@@ -591,7 +599,8 @@ async function showImage() {
   });
   layer.append(image, target);
   box.append(layer);
-  cropURL = URL.createObjectURL(new Blob([body], {type: 'image/png'}));
+  const type = new Uint8Array(body, 0, 1)[0] === 137 ? 'image/png' : 'image/webp';
+  cropURL = URL.createObjectURL(new Blob([body], {type}));
   image.src = cropURL;
 }
 
@@ -650,6 +659,7 @@ function showLocatorThumbnail(map, button, locator) {
   });
   image.addEventListener('error', () => {
     if (!map.contains(image)) return;
+    button.disabled = false;
     el('locator-copy').textContent = '暫時無法顯示這張定位圖。';
   });
   map.prepend(image);
@@ -662,60 +672,29 @@ function showLocator() {
   if (!overview) return;
   showLocatorThumbnail(el('locator-map'), el('locator-open'), overview);
   showLocatorThumbnail(el('locator-region-map'), el('locator-region-open'), region);
-  if (!images.has(overview.raw)) el('locator-open').disabled = overviewRequests.has(overview.raw);
-  const state = regionPackState.get(currentRegionPack());
-  const failed = state === 'failed';
-  if (!region) el('locator-region-open').disabled = state === 'loading';
-  el('locator-dialog-region').disabled = el('locator-region-open').disabled;
+  const rawRegion = regionAsset(tiles[index]);
+  if (!images.has(overview.raw)) el('locator-open').disabled = false;
+  if (!region) el('locator-region-open').disabled = false;
+  const failed = locatorFailures.has(overview.raw) || locatorFailures.has(rawRegion);
+  const loading = locatorRequests.has(overview.raw) || locatorRequests.has(rawRegion);
   el('locator-region-retry').hidden = !failed;
-  el('locator-copy').textContent = region ? '整圖黃框指向局部，局部黃框指向本題。' :
-    failed ? '局部定位暫時無法載入。整圖黃框仍指向本題。' :
-    state === 'loading' ? '正在載入局部定位…' :
-    overviewRequests.has(overview.raw) ? '正在載入整圖…' : '點選「整圖」或「局部」查看定位。';
+  el('locator-copy').textContent = loading ? '正在載入定位縮圖…' :
+    failed ? '部分定位縮圖未載入，請重試。' :
+    region ? '整圖黃框指向局部，局部黃框指向本題。' : '點選縮圖放大。';
   if (el('locator-dialog').open) showLocatorDialog(locatorDialogLevel);
 }
 
-async function openOverview() {
+async function openLocator(level) {
   const request = imageRequest;
-  const raw = tiles[index].locator.raw;
-  if (overviewRequests.has(raw)) return;
-  if (!images.has(raw)) {
-    overviewRequests.add(raw);
-    showLocator();
-    try {
-      images.set(raw, await readImage('overview', overviewNumbers.get(raw)));
-    } catch {} finally {
-      overviewRequests.delete(raw);
-      if (tiles[index].locator.raw === raw && !el('locator').hidden) showLocator();
-    }
-  }
-  if (request !== imageRequest) return;
-  const thumb = el('locator-map').querySelector('img');
-  if (!thumb) {
-    el('locator-copy').textContent = '無法載入整圖，請重試。';
-    return;
-  }
-  try {
-    await thumb.decode();
-    if (request === imageRequest) showLocatorDialog('overview');
-  } catch {
-    if (request === imageRequest) el('locator-copy').textContent = '無法顯示整圖，請重試。';
-  }
-}
-
-async function openRegion() {
-  const request = imageRequest;
-  const pack = currentRegionPack();
-  if (regionPackState.get(pack) === 'failed') regionPackState.delete(pack);
-  const loading = loadRegionPack();
+  const loading = loadLocatorAsset(level, index);
   showLocator();
   await loading;
   if (request !== imageRequest) return;
-  const thumb = el('locator-region-map').querySelector('img');
+  const thumb = el(level === 'region' ? 'locator-region-map' : 'locator-map').querySelector('img');
   if (!thumb) return;
   try {
     await thumb.decode();
-    if (request === imageRequest) showLocatorDialog('region');
+    if (request === imageRequest) showLocatorDialog(level);
   } catch {
     if (request === imageRequest) el('locator-copy').textContent = '暫時無法顯示這張定位圖。';
   }
@@ -780,11 +759,15 @@ el('prev').onclick = () => selectTile(index - 1);
 el('next').onclick = () => selectTile(index + 1);
 el('tile-select').onchange = event => selectTile(Number(event.target.value));
 el('retry-image').onclick = showImage;
-el('locator-open').onclick = openOverview;
-el('locator-region-open').onclick = openRegion;
-el('locator-dialog-overview').onclick = openOverview;
-el('locator-dialog-region').onclick = openRegion;
-el('locator-region-retry').onclick = openRegion;
+el('locator-open').onclick = () => openLocator('overview');
+el('locator-region-open').onclick = () => openLocator('region');
+el('locator-dialog-overview').onclick = () => openLocator('overview');
+el('locator-dialog-region').onclick = () => openLocator('region');
+el('locator-region-retry').onclick = () => {
+  void loadLocatorAsset('overview', index);
+  void loadLocatorAsset('region', index);
+  showLocator();
+};
 el('choices').addEventListener('change', event => {
   const decision = event.target.value;
   const previous = records[index].decision;
