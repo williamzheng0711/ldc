@@ -149,7 +149,7 @@ function saveAnswer(questionIndex) {
 
 async function readIndex(reviewKey) {
   try {
-    const plaintext = await readEncryptedSidecar('./review-index.bin?v=1', indexMagic, reviewKey);
+    const plaintext = await readEncryptedSidecar('./review-index-v2.bin', indexMagic, reviewKey);
     const manifest = JSON.parse(decoder.decode(plaintext));
     if (!manifest?.batch_id || !Array.isArray(manifest.tiles) || !manifest.tiles.length ||
         !manifest.tiles.every(validTile) ||
@@ -832,7 +832,7 @@ function loadEstimates() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20000);
   loadingEstimates = true;
-  estimateRequest = readEncryptedSidecar('./review-outlines.bin?v=2', outlineMagic, key, controller.signal)
+  estimateRequest = readEncryptedSidecar('./review-outlines-v3.bin', outlineMagic, key, controller.signal)
     .then(plaintext => {
       estimates = checkEstimates(JSON.parse(decoder.decode(plaintext)), batch);
     }).catch(() => {
