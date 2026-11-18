@@ -14,6 +14,8 @@ const imagesPerDirectory = 20;
 const ahead = 10;
 const behind = 2;
 const locatorAhead = 3;
+const cropConcurrency = 3;
+const cropCacheLimit = 24;
 const regionPath = /^\/images\/region-SD[0-9]{3}\.webp$/;
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const images = new Map();
@@ -29,7 +31,7 @@ let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
 let estimates = null, editor = null, viewport = null, loadingEstimates = false;
 let estimateRequest;
-let cropURL;
+let cropWindow = {order: [], failures: new Set()};
 let locatorDialogLevel = 'overview';
 let saveQueue = Promise.resolve();
 
@@ -216,7 +218,7 @@ async function downloadImagePacket(path, signal, onProgress, priority, retry = f
     resetTimeout();
     const response = await fetch(path, {
       credentials: 'omit', mode: 'same-origin', signal: connection.signal,
-      cache: retry ? 'reload' : 'default',
+      cache: retry ? 'reload' : 'force-cache',
       priority,
     });
     if (!response.ok) {
@@ -256,7 +258,7 @@ async function readImage(folder, questionIndex, controller, kind = 'crop') {
   const number = String(questionIndex + 1).padStart(3, '0');
   const path = './assets-v2/' + folder + '/' + (isRegion ? 'region-' : '') + number + '.bin';
   const isCurrent = () => kind === 'crop' && questionIndex === index;
-  const priority = isCurrent() || kind === 'crop' && questionIndex === index + 1 ? 'high' : 'auto';
+  const priority = kind === 'crop' && questionIndex >= index && questionIndex <= index + 2 ? 'high' : 'auto';
   function showProgress(received, total) {
     if (!isCurrent() || controller.signal.aborted) return;
     const percent = total > 0 ? Math.min(100, received / total * 100) : null;
@@ -293,11 +295,32 @@ function loadCrop(questionIndex) {
   if (pending) return pending.promise;
   const folder = cropFolder(questionIndex);
   const controller = new AbortController();
-  const promise = readImage(folder, questionIndex, controller).then(body => {
-    if (controller.signal.aborted) throw new Error();
-    cropCache.set(questionIndex, body);
-    if (cropCache.size > 40) cropCache.delete(cropCache.keys().next().value);
-    return body;
+  const promise = readImage(folder, questionIndex, controller).then(async body => {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    const tile = tiles[questionIndex];
+    const image = new Image(tile.width, tile.height);
+    image.alt = '本題的骨髓小圖，藍色短線指向要判斷的位置';
+    image.draggable = false;
+    const type = new Uint8Array(body, 0, 1)[0] === 137 ? 'image/png' : 'image/webp';
+    const url = URL.createObjectURL(new Blob([body], {type}));
+    image.src = url;
+    try {
+      await image.decode();
+      if (controller.signal.aborted) throw controller.signal.reason;
+    } catch (error) {
+      URL.revokeObjectURL(url);
+      throw error;
+    }
+    cropCache.set(questionIndex, {image, url});
+    if (cropCache.size > cropCacheLimit) {
+      const evicted = [...cropCache.keys()].find(cachedIndex =>
+        cachedIndex !== index && !cropWindow.order.includes(cachedIndex));
+      if (evicted !== undefined) {
+        URL.revokeObjectURL(cropCache.get(evicted).url);
+        cropCache.delete(evicted);
+      }
+    }
+    return cropCache.get(questionIndex);
   }).finally(() => {
     if (cropRequests.get(questionIndex)?.controller === controller) cropRequests.delete(questionIndex);
   });
@@ -305,28 +328,29 @@ function loadCrop(questionIndex) {
   return promise;
 }
 
-function cancelDistantCrops(questionIndex) {
+function updateCropWindow(questionIndex) {
+  const order = [];
+  for (let offset = 1; offset <= ahead && questionIndex + offset < tiles.length; offset++) {
+    order.push(questionIndex + offset);
+  }
+  for (let offset = 1; offset <= behind && questionIndex >= offset; offset++) order.push(questionIndex - offset);
+  cropWindow = {order, failures: new Set()};
   for (const [queuedIndex, request] of cropRequests) {
-    if (queuedIndex >= questionIndex - behind && queuedIndex <= questionIndex + ahead) continue;
+    if (queuedIndex === questionIndex || order.includes(queuedIndex)) continue;
     cropRequests.delete(queuedIndex);
     request.controller.abort();
   }
 }
 
-function prefetchCrops(questionIndex, request) {
-  const queue = [];
-  for (let offset = 1; offset <= ahead; offset++) {
-    if (questionIndex + offset < tiles.length) queue.push(questionIndex + offset);
+function fillCropWindow() {
+  if (!cropCache.has(index)) return;
+  for (const upcoming of cropWindow.order) {
+    if (cropRequests.size >= cropConcurrency) return;
+    if (cropCache.has(upcoming) || cropRequests.has(upcoming) || cropWindow.failures.has(upcoming)) continue;
+    void loadCrop(upcoming).catch(error => {
+      if (error?.name !== 'AbortError' || cropWindow.order.includes(upcoming)) cropWindow.failures.add(upcoming);
+    }).finally(fillCropWindow);
   }
-  for (let offset = 1; offset <= behind && questionIndex >= offset; offset++) queue.push(questionIndex - offset);
-  async function download() {
-    while (request === imageRequest && queue.length) {
-      try {
-        await loadCrop(queue.shift());
-      } catch {}
-    }
-  }
-  for (let worker = 0; worker < 3; worker++) void download();
 }
 
 function regionAsset(tile) {
@@ -527,7 +551,7 @@ async function showImage() {
   const questionIndex = index;
   const tile = tiles[questionIndex];
   const request = ++imageRequest;
-  cancelDistantCrops(questionIndex);
+  updateCropWindow(questionIndex);
   cancelDistantLocators(questionIndex);
   viewport?.destroy();
   viewport = null;
@@ -536,22 +560,19 @@ async function showImage() {
   el('zoom-tools').hidden = true;
   el('choices').disabled = true;
   el('note').disabled = true;
-  el('image-status').textContent = '正在載入影像…';
-  el('image-status').hidden = false;
+  const ready = cropCache.has(questionIndex);
+  el('image-status').textContent = ready ? '' : '正在載入影像…';
+  el('image-status').hidden = ready;
   const progress = el('image-download');
   progress.removeAttribute('value');
-  progress.hidden = false;
+  progress.hidden = ready;
   el('caption').hidden = true;
   el('retry-image').hidden = true;
   el('locator').hidden = true;
-  el('image-slot').replaceChildren();
-  if (cropURL) {
-    URL.revokeObjectURL(cropURL);
-    cropURL = undefined;
-  }
-  let body;
+  if (!ready) el('image-slot').replaceChildren();
+  let crop;
   try {
-    body = await loadCrop(questionIndex);
+    crop = await loadCrop(questionIndex);
   } catch {
     if (request !== imageRequest) return;
     progress.hidden = true;
@@ -560,8 +581,6 @@ async function showImage() {
     return;
   }
   if (request !== imageRequest) return;
-  progress.value = 100;
-  el('image-status').textContent = '正在顯示影像…';
   const box = document.createElement('div');
   box.className = 'image-box';
   box.style.aspectRatio = `${tile.width} / ${tile.height}`;
@@ -576,47 +595,29 @@ async function showImage() {
     target.style.setProperty('--target-y', `${(y + .5) / tile.height * 100}%`);
   }
   for (let i = 0; i < 4; i++) target.append(document.createElement('i'));
-  const image = document.createElement('img');
-  image.alt = '本題的骨髓小圖，藍色短線指向要判斷的位置';
-  image.width = tile.width;
-  image.height = tile.height;
-  image.draggable = false;
-  image.addEventListener('load', () => {
-    if (request !== imageRequest) return;
-    el('image-slot').replaceChildren(box);
-    el('image-status').hidden = true;
-    progress.hidden = true;
-    el('caption').hidden = false;
-    el('zoom-tools').hidden = false;
-    el('choices').disabled = false;
-    el('note').disabled = false;
-    editor = new OutlineEditor(layer, tile, points => {
-      if (request !== imageRequest || records[index].decision !== 'correct') return;
-      changeOutline(points);
-    });
-    viewport = new ImageViewport(box, layer, tile, renderZoom);
-    if (!estimateRequest) loadEstimates();
-    const points = showOutline();
-    if (records[index].decision === 'correct') viewport.focus(points);
-    renderZoom(viewport.zoom);
-    const overview = loadLocatorAsset('overview', questionIndex);
-    const region = loadLocatorAsset('region', questionIndex);
-    showLocator();
-    prefetchCrops(questionIndex, request);
-    void Promise.all([overview, region]).then(() => prefetchLocators(questionIndex, request));
-  });
-  image.addEventListener('error', () => {
-    if (request !== imageRequest) return;
-    cropCache.delete(questionIndex);
-    progress.hidden = true;
-    el('image-status').textContent = '無法載入這張影像，請重試。';
-    el('retry-image').hidden = false;
-  });
-  layer.append(image, target);
+  layer.append(crop.image, target);
   box.append(layer);
-  const type = new Uint8Array(body, 0, 1)[0] === 137 ? 'image/png' : 'image/webp';
-  cropURL = URL.createObjectURL(new Blob([body], {type}));
-  image.src = cropURL;
+  el('image-slot').replaceChildren(box);
+  el('image-status').hidden = true;
+  progress.hidden = true;
+  el('caption').hidden = false;
+  el('zoom-tools').hidden = false;
+  el('choices').disabled = false;
+  el('note').disabled = false;
+  editor = new OutlineEditor(layer, tile, points => {
+    if (request !== imageRequest || records[index].decision !== 'correct') return;
+    changeOutline(points);
+  });
+  viewport = new ImageViewport(box, layer, tile, renderZoom);
+  fillCropWindow();
+  if (!estimateRequest) loadEstimates();
+  const points = showOutline();
+  if (records[index].decision === 'correct') viewport.focus(points);
+  renderZoom(viewport.zoom);
+  const overview = loadLocatorAsset('overview', questionIndex);
+  const region = loadLocatorAsset('region', questionIndex);
+  showLocator();
+  void Promise.all([overview, region]).then(() => prefetchLocators(questionIndex, request));
 }
 
 function validLocatorBox(box) {
