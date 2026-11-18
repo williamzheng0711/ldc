@@ -14,17 +14,18 @@ const imagesPerDirectory = 20;
 const ahead = 10;
 const behind = 2;
 const locatorAhead = 3;
+const locatorConcurrency = 3;
+const locatorCacheLimit = 32;
 const cropConcurrency = 3;
 const cropCacheLimit = 24;
 const regionPath = /^\/images\/region-SD[0-9]{3}\.webp$/;
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
-const images = new Map();
+const locatorCache = new Map();
 const cropRequests = new Map();
 const cropCache = new Map();
 const overviewNumbers = new Map();
 const locatorRequests = new Map();
 const locatorFailures = new Set();
-const regions = new Map();
 const failedTiles = new Set();
 const outlineHistory = new Map();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
@@ -32,6 +33,7 @@ let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
 let estimates = null, editor = null, viewport = null, loadingEstimates = false;
 let estimateRequest;
 let cropWindow = {order: [], failures: new Set()};
+let locatorWindow = new Map();
 let locatorDialogLevel = 'overview';
 let saveQueue = Promise.resolve();
 
@@ -357,30 +359,59 @@ function regionAsset(tile) {
   return '/images/region-' + tile.id + '.webp';
 }
 
-function loadLocatorAsset(kind, questionIndex) {
+function locatorJob(kind, questionIndex) {
   const tile = tiles[questionIndex];
-  const isRegion = kind === 'region';
-  const raw = isRegion ? regionAsset(tile) : tile.locator.raw;
-  if (images.has(raw)) return Promise.resolve();
+  return {
+    kind, questionIndex,
+    raw: kind === 'region' ? regionAsset(tile) : tile.locator.raw,
+  };
+}
+
+function loadLocatorAsset({kind, questionIndex, raw}) {
+  const cached = locatorCache.get(raw);
+  if (cached) {
+    locatorCache.delete(raw);
+    locatorCache.set(raw, cached);
+    return Promise.resolve();
+  }
   if (locatorRequests.has(raw)) return locatorRequests.get(raw).promise;
   locatorFailures.delete(raw);
   const controller = new AbortController();
+  const isRegion = kind === 'region';
   const folder = isRegion ? cropFolder(questionIndex) : 'overview';
   const number = isRegion ? questionIndex : overviewNumbers.get(raw);
-  const promise = readImage(folder, number, controller, kind).then(plaintext => {
+  const promise = readImage(folder, number, controller, kind).then(async plaintext => {
     if (controller.signal.aborted) return;
-    if (!isRegion) {
-      images.set(raw, plaintext);
-      return;
+    let body = plaintext;
+    let region;
+    if (isRegion) {
+      const bytes = new Uint8Array(plaintext);
+      const start = 4 + new DataView(plaintext).getUint32(0);
+      if (start >= bytes.length) throw new Error();
+      region = JSON.parse(decoder.decode(bytes.subarray(4, start)));
+      if (!validLocator(region, regionPath) || region.raw !== raw ||
+          !validLocatorBox(region.whole_box)) throw new Error();
+      body = bytes.subarray(start);
     }
-    const bytes = new Uint8Array(plaintext);
-    const start = 4 + new DataView(plaintext).getUint32(0);
-    if (start >= bytes.length) throw new Error();
-    const region = JSON.parse(decoder.decode(bytes.subarray(4, start)));
-    if (!validLocator(region, regionPath) || region.raw !== raw ||
-        !validLocatorBox(region.whole_box)) throw new Error();
-    regions.set(tile.id, region);
-    images.set(raw, bytes.subarray(start));
+    const image = new Image();
+    image.alt = '';
+    const url = URL.createObjectURL(new Blob([body], {type: 'image/webp'}));
+    image.src = url;
+    try {
+      await image.decode();
+      if (controller.signal.aborted) throw controller.signal.reason;
+    } catch (error) {
+      URL.revokeObjectURL(url);
+      throw error;
+    }
+    locatorCache.set(raw, {image, url, region});
+    if (locatorCache.size > locatorCacheLimit) {
+      const evicted = [...locatorCache.keys()].find(asset => !locatorWindow.has(asset));
+      if (evicted !== undefined) {
+        URL.revokeObjectURL(locatorCache.get(evicted).url);
+        locatorCache.delete(evicted);
+      }
+    }
   }).catch(() => {
     if (!controller.signal.aborted) locatorFailures.add(raw);
   }).finally(() => {
@@ -388,28 +419,41 @@ function loadLocatorAsset(kind, questionIndex) {
     locatorRequests.delete(raw);
     const current = tiles[index];
     if (!el('locator').hidden && (raw === current.locator.raw || raw === regionAsset(current))) showLocator();
+    fillLocatorWindow();
   });
   locatorRequests.set(raw, {controller, promise});
   return promise;
 }
 
-function cancelDistantLocators(questionIndex) {
-  const nearby = tiles.slice(Math.max(0, questionIndex - behind), questionIndex + locatorAhead + 1);
-  const wanted = new Set(nearby.flatMap(tile => [tile.locator.raw, regionAsset(tile)]));
+function updateLocatorWindow(questionIndex) {
+  locatorWindow = new Map();
+  const nearby = [questionIndex];
+  for (let offset = 1; offset <= locatorAhead && questionIndex + offset < tiles.length; offset++) {
+    nearby.push(questionIndex + offset);
+  }
+  for (let offset = 1; offset <= behind && questionIndex >= offset; offset++) nearby.push(questionIndex - offset);
+  for (const next of nearby) {
+    for (const kind of ['overview', 'region']) {
+      const job = locatorJob(kind, next);
+      if (!locatorWindow.has(job.raw)) locatorWindow.set(job.raw, job);
+    }
+  }
+  for (const raw of locatorFailures) {
+    if (!locatorWindow.has(raw)) locatorFailures.delete(raw);
+  }
   for (const [raw, request] of locatorRequests) {
-    if (wanted.has(raw)) continue;
+    if (locatorWindow.has(raw)) continue;
     locatorRequests.delete(raw);
     request.controller.abort();
   }
 }
 
-async function prefetchLocators(questionIndex, request) {
-  for (let offset = 1; offset <= locatorAhead; offset++) {
-    const upcoming = questionIndex + offset;
-    if (request !== imageRequest || upcoming >= tiles.length) return;
-    await loadLocatorAsset('region', upcoming);
-    if (request !== imageRequest) return;
-    await loadLocatorAsset('overview', upcoming);
+function fillLocatorWindow() {
+  if (el('locator').hidden) return;
+  for (const [raw, job] of locatorWindow) {
+    if (locatorRequests.size >= locatorConcurrency) return;
+    if (locatorCache.has(raw) || locatorRequests.has(raw) || locatorFailures.has(raw)) continue;
+    void loadLocatorAsset(job);
   }
 }
 
@@ -494,14 +538,6 @@ function renderProgress() {
   }
 }
 
-function imageURL(path) {
-  const entry = images.get(path);
-  if (typeof entry === 'string') return entry;
-  const url = URL.createObjectURL(new Blob([entry], {type: 'image/webp'}));
-  images.set(path, url);
-  return url;
-}
-
 function applyOutline(points) {
   if (points === undefined) delete records[index].outline;
   else records[index].outline = points;
@@ -552,7 +588,7 @@ async function showImage() {
   const tile = tiles[questionIndex];
   const request = ++imageRequest;
   updateCropWindow(questionIndex);
-  cancelDistantLocators(questionIndex);
+  updateLocatorWindow(questionIndex);
   viewport?.destroy();
   viewport = null;
   editor = null;
@@ -614,10 +650,8 @@ async function showImage() {
   const points = showOutline();
   if (records[index].decision === 'correct') viewport.focus(points);
   renderZoom(viewport.zoom);
-  const overview = loadLocatorAsset('overview', questionIndex);
-  const region = loadLocatorAsset('region', questionIndex);
   showLocator();
-  void Promise.all([overview, region]).then(() => prefetchLocators(questionIndex, request));
+  fillLocatorWindow();
 }
 
 function validLocatorBox(box) {
@@ -645,75 +679,59 @@ function setLocatorFrame(map, locator) {
 
 function currentLocators() {
   const tile = tiles[index];
-  const region = regions.get(tile.id);
+  const region = locatorCache.get(regionAsset(tile))?.region;
   const overview = region ? {...tile.locator, box: region.whole_box} : tile.locator;
   return {overview, region};
 }
 
-function showLocatorThumbnail(map, button, locator) {
+function showLocatorThumbnail(map, locator) {
   const frame = map.querySelector('.locator-frame');
   const previous = map.querySelector('img');
-  if (!locator || !images.has(locator.raw)) {
+  const cached = locator && locatorCache.get(locator.raw);
+  const placeholder = map.parentElement.querySelector('.locator-placeholder');
+  placeholder.hidden = Boolean(cached);
+  if (!cached) {
     previous?.remove();
     frame.hidden = true;
-    button.disabled = true;
+    map.hidden = true;
     return;
   }
+  map.hidden = false;
   setLocatorFrame(map, locator);
-  const url = imageURL(locator.raw);
-  if (previous?.getAttribute('src') === url && (!previous.complete || previous.naturalWidth)) return;
-  previous?.remove();
-  frame.hidden = true;
-  button.disabled = true;
-  const image = new Image(locator.width, locator.height);
-  image.alt = '';
-  image.addEventListener('load', () => {
-    if (!map.contains(image)) return;
-    frame.hidden = false;
-    button.disabled = false;
-    el('locator-dialog-region').disabled = el('locator-region-open').disabled;
-  });
-  image.addEventListener('error', () => {
-    if (!map.contains(image)) return;
-    button.disabled = false;
-    el('locator-copy').textContent = '暫時無法顯示這張定位圖。';
-  });
-  map.prepend(image);
-  image.src = url;
+  if (previous !== cached.image) {
+    previous?.remove();
+    map.prepend(cached.image);
+  }
+  frame.hidden = false;
 }
 
 function showLocator() {
   const {overview, region} = currentLocators();
   el('locator').hidden = !overview;
   if (!overview) return;
-  showLocatorThumbnail(el('locator-map'), el('locator-open'), overview);
-  showLocatorThumbnail(el('locator-region-map'), el('locator-region-open'), region);
+  showLocatorThumbnail(el('locator-map'), overview);
+  showLocatorThumbnail(el('locator-region-map'), region);
   const rawRegion = regionAsset(tiles[index]);
-  if (!images.has(overview.raw)) el('locator-open').disabled = false;
-  if (!region) el('locator-region-open').disabled = false;
+  el('locator-open').disabled = false;
+  el('locator-region-open').disabled = false;
+  el('locator-overview-placeholder').textContent = locatorFailures.has(overview.raw) ? '點按重試' : '準備整圖…';
+  el('locator-region-placeholder').textContent = locatorFailures.has(rawRegion) ? '點按重試' : '準備局部…';
   const failed = locatorFailures.has(overview.raw) || locatorFailures.has(rawRegion);
   const loading = locatorRequests.has(overview.raw) || locatorRequests.has(rawRegion);
   el('locator-region-retry').hidden = !failed;
-  el('locator-copy').textContent = loading ? '正在載入定位縮圖…' :
-    failed ? '部分定位縮圖未載入，請重試。' :
+  el('locator-copy').textContent = failed ? '部分定位縮圖未載入，請重試。' :
+    loading || !locatorCache.has(overview.raw) || !region ? '正在準備定位縮圖…' :
     region ? '整圖黃框指向局部，局部黃框指向本題。' : '點選縮圖放大。';
   if (el('locator-dialog').open) showLocatorDialog(locatorDialogLevel);
 }
 
 async function openLocator(level) {
   const request = imageRequest;
-  const loading = loadLocatorAsset(level, index);
+  const loading = loadLocatorAsset(locatorJob(level, index));
   showLocator();
   await loading;
   if (request !== imageRequest) return;
-  const thumb = el(level === 'region' ? 'locator-region-map' : 'locator-map').querySelector('img');
-  if (!thumb) return;
-  try {
-    await thumb.decode();
-    if (request === imageRequest) showLocatorDialog(level);
-  } catch {
-    if (request === imageRequest) el('locator-copy').textContent = '暫時無法顯示這張定位圖。';
-  }
+  showLocatorDialog(level);
 }
 
 function showLocatorDialog(level) {
@@ -780,8 +798,8 @@ el('locator-region-open').onclick = () => openLocator('region');
 el('locator-dialog-overview').onclick = () => openLocator('overview');
 el('locator-dialog-region').onclick = () => openLocator('region');
 el('locator-region-retry').onclick = () => {
-  void loadLocatorAsset('overview', index);
-  void loadLocatorAsset('region', index);
+  void loadLocatorAsset(locatorJob('overview', index));
+  void loadLocatorAsset(locatorJob('region', index));
   showLocator();
 };
 el('choices').addEventListener('change', event => {

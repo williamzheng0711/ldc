@@ -181,6 +181,7 @@
   .locator-open:enabled:hover { border-color: #ffdc68; background: #263240; }
   .locator-open:disabled { opacity: .8; }
   .locator-preview { height: var(--locator-thumb-height); display: grid; place-items: center; overflow: hidden; }
+  .locator-placeholder { color: #c8d4de; font-size: .75rem; }
   .locator-preview .locator-map { width: min(100%, calc(var(--locator-thumb-height) * var(--locator-ratio, 1))); }
   .locator-title { display: block; padding: 4px 8px; font-size: .82rem; font-weight: 680; }
   .locator-copy { color: #d1dde4; font-size: .79rem; line-height: 1.45; }
@@ -367,11 +368,11 @@
       <div class="locator" id="locator" hidden>
         <div class="locator-thumbs">
           <button type="button" class="locator-open" id="locator-open" aria-label="放大整圖定位" aria-haspopup="dialog" disabled>
-            <span class="locator-preview"><span class="locator-map" id="locator-map"><span class="locator-frame" aria-hidden="true" hidden></span></span></span>
+            <span class="locator-preview"><span class="locator-placeholder" id="locator-overview-placeholder" aria-hidden="true">準備整圖…</span><span class="locator-map" id="locator-map" hidden><span class="locator-frame" aria-hidden="true" hidden></span></span></span>
             <span class="locator-title">整圖</span>
           </button>
           <button type="button" class="locator-open" id="locator-region-open" aria-label="放大局部定位" aria-haspopup="dialog" disabled>
-            <span class="locator-preview"><span class="locator-map" id="locator-region-map"><span class="locator-frame" aria-hidden="true" hidden></span></span></span>
+            <span class="locator-preview"><span class="locator-placeholder" id="locator-region-placeholder" aria-hidden="true">準備局部…</span><span class="locator-map" id="locator-region-map" hidden><span class="locator-frame" aria-hidden="true" hidden></span></span></span>
             <span class="locator-title">局部</span>
           </button>
         </div>
@@ -425,6 +426,6 @@
 </dialog>
 <script src="./outline.js?v=4" defer></script>
 <script src="./viewport.js?v=1" defer></script>
-<script src="./review.js?v=508" defer></script>
+<script src="./review.js?v=509" defer></script>
 </body>
 </html>
