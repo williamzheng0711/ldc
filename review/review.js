@@ -13,6 +13,7 @@ const regionMagic = encoder.encode('LDCRGN01');
 const imagesPerDirectory = 20;
 const ahead = 10;
 const behind = 2;
+const locatorAhead = 3;
 const regionPath = /^\/images\/region-SD[0-9]{3}\.webp$/;
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const images = new Map();
@@ -361,17 +362,30 @@ function loadLocatorAsset(kind, questionIndex) {
   }).finally(() => {
     if (locatorRequests.get(raw)?.controller !== controller) return;
     locatorRequests.delete(raw);
-    if (!el('locator').hidden) showLocator();
+    const current = tiles[index];
+    if (!el('locator').hidden && (raw === current.locator.raw || raw === regionAsset(current))) showLocator();
   });
   locatorRequests.set(raw, {controller, promise});
   return promise;
 }
 
-function cancelDistantLocators(tile) {
+function cancelDistantLocators(questionIndex) {
+  const nearby = tiles.slice(Math.max(0, questionIndex - behind), questionIndex + locatorAhead + 1);
+  const wanted = new Set(nearby.flatMap(tile => [tile.locator.raw, regionAsset(tile)]));
   for (const [raw, request] of locatorRequests) {
-    if (raw === tile.locator.raw || raw === regionAsset(tile)) continue;
+    if (wanted.has(raw)) continue;
     locatorRequests.delete(raw);
     request.controller.abort();
+  }
+}
+
+async function prefetchLocators(questionIndex, request) {
+  for (let offset = 1; offset <= locatorAhead; offset++) {
+    const upcoming = questionIndex + offset;
+    if (request !== imageRequest || upcoming >= tiles.length) return;
+    await loadLocatorAsset('region', upcoming);
+    if (request !== imageRequest) return;
+    await loadLocatorAsset('overview', upcoming);
   }
 }
 
@@ -514,7 +528,7 @@ async function showImage() {
   const tile = tiles[questionIndex];
   const request = ++imageRequest;
   cancelDistantCrops(questionIndex);
-  cancelDistantLocators(tile);
+  cancelDistantLocators(questionIndex);
   viewport?.destroy();
   viewport = null;
   editor = null;
@@ -585,10 +599,11 @@ async function showImage() {
     const points = showOutline();
     if (records[index].decision === 'correct') viewport.focus(points);
     renderZoom(viewport.zoom);
-    void loadLocatorAsset('overview', questionIndex);
-    void loadLocatorAsset('region', questionIndex);
+    const overview = loadLocatorAsset('overview', questionIndex);
+    const region = loadLocatorAsset('region', questionIndex);
     showLocator();
     prefetchCrops(questionIndex, request);
+    void Promise.all([overview, region]).then(() => prefetchLocators(questionIndex, request));
   });
   image.addEventListener('error', () => {
     if (request !== imageRequest) return;
