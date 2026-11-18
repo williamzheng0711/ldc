@@ -6,13 +6,16 @@ const validDecisions = new Set(choices.map(input => input.value));
 const TARGET = 'target';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', {fatal: true});
-const magic = encoder.encode('LDCREV01');
+const indexMagic = encoder.encode('LDCIDX01');
+const imageMagic = encoder.encode('LDCIMG01');
 const outlineMagic = encoder.encode('LDCOUT01');
 const regionMagic = encoder.encode('LDCCTX01');
 const regionsPerPack = 25;
+const imagesPerPack = 20;
 const regionPath = /^\/images\/region-SD[0-9]{3}\.webp$/;
 const imagePath = /^\/images\/[a-z0-9_.-]+\.png$/i;
 const images = new Map();
+const imagePacks = new Map();
 const regions = new Map();
 const regionPackState = new Map();
 const failedTiles = new Set();
@@ -20,6 +23,7 @@ const outlineHistory = new Map();
 let batch, tiles = [], records = [], reviewerName, key, storagePrefix;
 let index = 0, imageRequest = 0, pendingSaves = 0, restoreWarning = false;
 let estimates = null, editor = null, viewport = null, loadingEstimates = false;
+let estimateRequest;
 let locatorDialogLevel = 'overview';
 let saveQueue = Promise.resolve();
 
@@ -133,38 +137,23 @@ function saveAnswer(questionIndex) {
   });
 }
 
-async function readBundle(reviewKey) {
-  let bytes;
+async function readIndex(reviewKey) {
   try {
-    const response = await fetch('./review-data.bin?v=500', {credentials: 'omit', mode: 'same-origin', cache: 'no-cache'});
-    if (!response.ok) throw new Error();
-    bytes = new Uint8Array(await response.arrayBuffer());
-  } catch {
-    throw new Error('無法下載題目。請確認網路連線後再試。');
-  }
-
-  const header = bytes.subarray(0, magic.length);
-  if (bytes.length < 40 || !magic.every((value, i) => value === header[i])) {
-    throw new Error('題目檔格式不符，請聯絡研究團隊。');
-  }
-  let plaintext;
-  try {
-    plaintext = await crypto.subtle.decrypt({
-      name: 'AES-GCM', iv: bytes.subarray(8, 20), additionalData: header,
-    }, reviewKey, bytes.subarray(20));
-  } catch {
-    throw new Error('無法解鎖題目。請確認收到的金鑰。');
-  }
-  try {
-    return parseBundle(plaintext);
-  } catch {
-    throw new Error('題目檔內容不完整，請聯絡研究團隊。');
+    const plaintext = await readEncryptedSidecar('./review-index.bin?v=1', indexMagic, reviewKey);
+    const manifest = JSON.parse(decoder.decode(plaintext));
+    if (!manifest?.batch_id || !Array.isArray(manifest.tiles) || !manifest.tiles.length ||
+        !manifest.tiles.every(validTile) ||
+        new Set(manifest.tiles.map(tile => tile.id)).size !== manifest.tiles.length) throw new Error();
+    return manifest;
+  } catch (error) {
+    if (error.name === 'OperationError') throw new Error('無法解鎖題目。請確認收到的金鑰。');
+    throw new Error('無法載入題目索引。請確認網路連線後再試。');
   }
 }
 
-async function readEncryptedSidecar(path, expectedHeader, reviewKey) {
+async function readEncryptedSidecar(path, expectedHeader, reviewKey, signal) {
   const response = await fetch(path, {
-    credentials: 'omit', mode: 'same-origin', cache: 'no-cache',
+    credentials: 'omit', mode: 'same-origin', signal,
   });
   if (!response.ok) throw new Error();
   const bytes = new Uint8Array(await response.arrayBuffer());
@@ -175,11 +164,6 @@ async function readEncryptedSidecar(path, expectedHeader, reviewKey) {
   }, reviewKey, bytes.subarray(20));
 }
 
-async function readEstimates(reviewKey) {
-  const plaintext = await readEncryptedSidecar('./review-outlines.bin?v=2', outlineMagic, reviewKey);
-  return JSON.parse(decoder.decode(plaintext));
-}
-
 function checkEstimates(data, manifest) {
   if (data?.batch_id !== manifest.batch_id || !data.outlines ||
       !manifest.tiles.every(tile => Object.hasOwn(data.outlines, tile.id) &&
@@ -187,10 +171,10 @@ function checkEstimates(data, manifest) {
   return data.outlines;
 }
 
-function validTile(tile, contents) {
+function validTile(tile) {
   if (!tile || typeof tile.id !== 'string' || !tile.id || !Number.isInteger(tile.width) ||
       !Number.isInteger(tile.height) || tile.width < 1 || tile.height < 1 ||
-      !contents.has(tile.raw) || !validLocator(tile.locator) || !contents.has(tile.locator.raw) ||
+      typeof tile.raw !== 'string' || !imagePath.test(tile.raw) || !validLocator(tile.locator) ||
       tile.items?.length !== 1 || tile.items[0].id !== TARGET) return false;
   if (!tile.target_xy_px) return true;
   return Array.isArray(tile.target_xy_px) && tile.target_xy_px.length === 2 &&
@@ -216,13 +200,26 @@ function parseAssetBundle(plaintext, allowedPath) {
   return {metadata, contents};
 }
 
-function parseBundle(plaintext) {
-  const {metadata, contents} = parseAssetBundle(plaintext, imagePath);
-  const manifest = metadata.batch;
-  if (!manifest?.batch_id || !Array.isArray(manifest.tiles) || !manifest.tiles.length ||
-      !manifest.tiles.every(tile => validTile(tile, contents)) ||
-      new Set(manifest.tiles.map(tile => tile.id)).size !== manifest.tiles.length) throw new Error();
-  return {manifest, contents};
+function loadImagePack(questionIndex) {
+  const pack = Math.floor(questionIndex / imagesPerPack);
+  if (!imagePacks.has(pack)) {
+    const file = './review-images-' + String(pack + 1).padStart(2, '0') + '.bin?v=1';
+    const request = readEncryptedSidecar(file, imageMagic, key).then(plaintext => {
+      const {metadata, contents} = parseAssetBundle(plaintext, imagePath);
+      const expected = tiles.slice(pack * imagesPerPack, (pack + 1) * imagesPerPack);
+      const paths = new Set(expected.flatMap(tile => [tile.raw, tile.locator.raw]));
+      if (metadata.batch_id !== batch.batch_id || metadata.pack !== pack ||
+          contents.size !== paths.size || ![...paths].every(path => contents.has(path))) throw new Error();
+      for (const [path, body] of contents) {
+        if (!images.has(path)) images.set(path, body);
+      }
+    }).catch(error => {
+      imagePacks.delete(pack);
+      throw error;
+    });
+    imagePacks.set(pack, request);
+  }
+  return imagePacks.get(pack);
 }
 
 function currentRegionPack() {
@@ -252,7 +249,7 @@ async function loadRegionPack() {
   } catch {
     regionPackState.set(pack, 'failed');
   }
-  if (pack === currentRegionPack()) showLocator();
+  if (pack === currentRegionPack() && !el('locator').hidden) showLocator();
 }
 
 el('unlock-form').addEventListener('submit', async event => {
@@ -272,14 +269,11 @@ el('unlock-form').addEventListener('submit', async event => {
     return;
   }
   button.disabled = true;
-  status.textContent = '正在下載與解鎖題目…';
+  status.textContent = '正在解鎖題目索引…';
   try {
     const raw = decodeBase64(access);
     const reviewKey = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt', 'encrypt']);
-    const [{manifest, contents}, outlineData] = await Promise.all([
-      readBundle(reviewKey), readEstimates(reviewKey).catch(() => null),
-    ]);
-    estimates = checkEstimates(outlineData, manifest);
+    const manifest = await readIndex(reviewKey);
     const keyId = encodeBase64(new Uint8Array(await crypto.subtle.digest('SHA-256', raw)).subarray(0, 12));
     raw.fill(0);
     key = reviewKey;
@@ -288,9 +282,6 @@ el('unlock-form').addEventListener('submit', async event => {
     reviewerName = name;
     storagePrefix = 'ldc-review-v1:' + JSON.stringify([batch.batch_id, reviewerName, keyId]) + ':';
     records = await Promise.all(tiles.map(loadDraft));
-    for (const [path, body] of contents) {
-      images.set(path, body);
-    }
     el('access-key').value = '';
     el('reviewer').textContent = reviewerName;
     el('account').hidden = false;
@@ -365,14 +356,14 @@ function changeOutline(points) {
   applyOutline(points);
 }
 
-function showOutline() {
+function showOutline(keepGesture = false) {
   const visible = editor && records[index].decision === 'correct';
   el('outline-tools').hidden = !visible;
   const tile = tiles[index];
   const estimate = visible ? estimates?.[tile.id] : null;
   const draft = visible ? records[index].outline : null;
   const points = draft ?? estimate;
-  editor?.setPoints(points);
+  if (editor && !(keepGesture && editor.drag)) editor.setPoints(points);
   el('outline-undo').hidden = !points;
   el('outline-undo').disabled = !points || !outlineHistory.get(index)?.length;
   el('outline-reset').hidden = !estimate;
@@ -393,7 +384,7 @@ function renderZoom(zoom) {
   if (editor?.points) editor.paint();
 }
 
-function showImage() {
+async function showImage() {
   const tile = tiles[index];
   const request = ++imageRequest;
   viewport?.destroy();
@@ -407,6 +398,17 @@ function showImage() {
   el('image-status').hidden = false;
   el('caption').hidden = true;
   el('retry-image').hidden = true;
+  el('locator').hidden = true;
+  el('image-slot').replaceChildren();
+  try {
+    await loadImagePack(index);
+  } catch {
+    if (request !== imageRequest) return;
+    el('image-status').textContent = '無法下載這組題目的影像，請重試。';
+    el('retry-image').hidden = false;
+    return;
+  }
+  if (request !== imageRequest) return;
   const box = document.createElement('div');
   box.className = 'image-box';
   box.style.aspectRatio = `${tile.width} / ${tile.height}`;
@@ -439,6 +441,7 @@ function showImage() {
       changeOutline(points);
     });
     viewport = new ImageViewport(box, layer, tile, renderZoom);
+    if (!estimateRequest) loadEstimates();
     const points = showOutline();
     if (records[index].decision === 'correct') viewport.focus(points);
     renderZoom(viewport.zoom);
@@ -450,8 +453,8 @@ function showImage() {
   });
   layer.append(image, target);
   box.append(layer);
-  el('image-slot').replaceChildren();
   image.src = imageURL(tile.raw);
+  showLocator();
 }
 
 function validLocatorBox(box) {
@@ -521,11 +524,33 @@ function showLocator() {
   if (!overview) return;
   showLocatorThumbnail(el('locator-map'), el('locator-open'), overview);
   showLocatorThumbnail(el('locator-region-map'), el('locator-region-open'), region);
-  const failed = regionPackState.get(currentRegionPack()) === 'failed';
+  const state = regionPackState.get(currentRegionPack());
+  const failed = state === 'failed';
+  if (!region) el('locator-region-open').disabled = state === 'loading';
+  el('locator-dialog-region').disabled = el('locator-region-open').disabled;
   el('locator-region-retry').hidden = !failed;
   el('locator-copy').textContent = region ? '整圖黃框指向局部，局部黃框指向本題。' :
-    failed ? '局部定位暫時無法載入。整圖黃框仍指向本題。' : '正在載入局部定位…';
+    failed ? '局部定位暫時無法載入。整圖黃框仍指向本題。' :
+    state === 'loading' ? '正在載入局部定位…' : '點選「局部」查看本題周邊。';
   if (el('locator-dialog').open) showLocatorDialog(locatorDialogLevel);
+}
+
+async function openRegion() {
+  const request = imageRequest;
+  const pack = currentRegionPack();
+  if (regionPackState.get(pack) === 'failed') regionPackState.delete(pack);
+  const loading = loadRegionPack();
+  showLocator();
+  await loading;
+  if (request !== imageRequest) return;
+  const thumb = el('locator-region-map').querySelector('img');
+  if (!thumb) return;
+  try {
+    await thumb.decode();
+    if (request === imageRequest) showLocatorDialog('region');
+  } catch {
+    if (request === imageRequest) el('locator-copy').textContent = '暫時無法顯示這張定位圖。';
+  }
 }
 
 function showLocatorDialog(level) {
@@ -558,12 +583,21 @@ function selectTile(next) {
   el('prev').disabled = index === 0;
   el('next').disabled = index === tiles.length - 1;
   renderAnswers();
-  showImage();
-  void loadRegionPack();
-  showLocator();
+  void showImage();
 }
 
-function exportNotes() {
+async function exportNotes() {
+  const button = el('export');
+  if (records.some(record => record.decision === 'correct' && !record.outline)) {
+    if (!estimateRequest) loadEstimates();
+    if (loadingEstimates) {
+      button.disabled = true;
+      button.textContent = '正在載入輪廓…';
+      await estimateRequest;
+      button.disabled = false;
+      button.textContent = '下載標註 JSON';
+    }
+  }
   const result = { ...payloadFor(), reviewer: reviewerName };
   const json = JSON.stringify(result, null, 2) + '\n';
   const url = URL.createObjectURL(new Blob([json], {type: 'application/json'}));
@@ -579,15 +613,10 @@ el('next').onclick = () => selectTile(index + 1);
 el('tile-select').onchange = event => selectTile(Number(event.target.value));
 el('retry-image').onclick = showImage;
 el('locator-open').onclick = () => showLocatorDialog('overview');
-el('locator-region-open').onclick = () => showLocatorDialog('region');
+el('locator-region-open').onclick = openRegion;
 el('locator-dialog-overview').onclick = () => showLocatorDialog('overview');
-el('locator-dialog-region').onclick = () => showLocatorDialog('region');
-el('locator-region-retry').onclick = () => {
-  if (regionPackState.get(currentRegionPack()) !== 'failed') return;
-  regionPackState.delete(currentRegionPack());
-  void loadRegionPack();
-  showLocator();
-};
+el('locator-dialog-region').onclick = openRegion;
+el('locator-region-retry').onclick = openRegion;
 el('choices').addEventListener('change', event => {
   const decision = event.target.value;
   const previous = records[index].decision;
@@ -613,19 +642,28 @@ el('outline-undo').onclick = () => {
   if (history?.length) applyOutline(history.pop());
 };
 el('outline-reset').onclick = () => changeOutline(undefined);
-el('outline-retry').onclick = async () => {
-  const requestedImage = imageRequest;
+function loadEstimates() {
+  if (loadingEstimates) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
   loadingEstimates = true;
-  showOutline();
-  try {
-    estimates = checkEstimates(await readEstimates(key), batch);
-  } catch {
-    estimates = null;
-  } finally {
-    loadingEstimates = false;
-    const points = showOutline();
-    if (requestedImage === imageRequest && points) viewport?.focus(points);
-  }
+  estimateRequest = readEncryptedSidecar('./review-outlines.bin?v=2', outlineMagic, key, controller.signal)
+    .then(plaintext => {
+      estimates = checkEstimates(JSON.parse(decoder.decode(plaintext)), batch);
+    }).catch(() => {
+      estimates = null;
+    }).finally(() => {
+      clearTimeout(timeout);
+      loadingEstimates = false;
+      if (!editor) return;
+      const points = showOutline(true);
+      if (points && !records[index].outline && viewport.zoom === 1) viewport.focus(points);
+    });
+}
+
+el('outline-retry').onclick = () => {
+  loadEstimates();
+  showOutline(true);
 };
 el('note').oninput = event => {
   records[index].note = event.target.value;
