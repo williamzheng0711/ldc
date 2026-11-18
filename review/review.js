@@ -255,7 +255,7 @@ async function readImage(folder, questionIndex, controller, kind = 'crop') {
   const number = String(questionIndex + 1).padStart(3, '0');
   const path = './assets-v2/' + folder + '/' + (isRegion ? 'region-' : '') + number + '.bin';
   const isCurrent = () => kind === 'crop' && questionIndex === index;
-  const priority = isCurrent() ? 'high' : kind === 'crop' ? 'auto' : 'low';
+  const priority = isCurrent() || kind === 'crop' && questionIndex === index + 1 ? 'high' : 'auto';
   function showProgress(received, total) {
     if (!isCurrent() || controller.signal.aborted) return;
     const percent = total > 0 ? Math.min(100, received / total * 100) : null;
@@ -585,10 +585,10 @@ async function showImage() {
     const points = showOutline();
     if (records[index].decision === 'correct') viewport.focus(points);
     renderZoom(viewport.zoom);
-    prefetchCrops(questionIndex, request);
     void loadLocatorAsset('overview', questionIndex);
     void loadLocatorAsset('region', questionIndex);
     showLocator();
+    prefetchCrops(questionIndex, request);
   });
   image.addEventListener('error', () => {
     if (request !== imageRequest) return;
